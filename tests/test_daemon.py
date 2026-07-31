@@ -199,6 +199,7 @@ class DetectionTests(unittest.TestCase):
             self.assertEqual(candidates[0]["thread_id"], thread_id)
             self.assertEqual(candidates[0]["turn_id"], "turn-overload")
 
+
     def test_open_to_closed_replay_queues_and_deduplicates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -335,6 +336,54 @@ class DetectionTests(unittest.TestCase):
         self.assertIn(".hermes/node/bin", joined)
 
 
+class CodexStateDatabaseTests(unittest.TestCase):
+    def test_modern_state_database_is_preferred_over_legacy_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            modern = home / ".codex" / "state_5.sqlite"
+            legacy = home / ".codex" / "sqlite" / "state_5.sqlite"
+            modern.parent.mkdir(parents=True)
+            legacy.parent.mkdir(parents=True)
+            modern.touch()
+            legacy.touch()
+            config = {"codex_state_db": str(legacy)}
+
+            self.assertEqual(daemon.resolve_codex_state_db(config, home=home), modern)
+
+    def test_legacy_state_database_remains_a_compatible_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            legacy = home / ".codex" / "sqlite" / "state_5.sqlite"
+            legacy.parent.mkdir(parents=True)
+            legacy.touch()
+            config = {"codex_state_db": str(legacy)}
+
+            self.assertEqual(daemon.resolve_codex_state_db(config, home=home), legacy)
+
+    def test_custom_state_database_path_is_never_replaced(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            modern = home / ".codex" / "state_5.sqlite"
+            custom = home / "my-codex" / "custom.sqlite"
+            modern.parent.mkdir(parents=True)
+            modern.touch()
+            config = {"codex_state_db": str(custom)}
+
+            self.assertEqual(daemon.resolve_codex_state_db(config, home=home), custom)
+
+    def test_unreadable_database_warning_is_throttled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = Path(tmp) / "broken.sqlite"
+            broken.write_text("not sqlite", encoding="utf-8")
+            config = {"codex_state_db": str(broken)}
+            daemon._WARNING_THROTTLE.clear()
+            with mock.patch.object(daemon.logging, "warning") as warning:
+                daemon.thread_paths_from_db(config, {"019fb64d-d041-7842-adbf-01b165ad1b13"})
+                daemon.thread_paths_from_db(config, {"019fb64d-d041-7842-adbf-01b165ad1b13"})
+
+            self.assertEqual(warning.call_count, 1)
+
+
 class ModelRetryTests(unittest.TestCase):
     def test_capacity_fallback_moves_high_to_medium_to_low_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
@@ -402,7 +451,41 @@ class ModelRetryTests(unittest.TestCase):
     def test_capacity_error_classifier_is_precise(self):
         self.assertTrue(daemon.is_model_capacity_error("Selected model is at capacity"))
         self.assertTrue(daemon.is_model_capacity_error("server_overloaded"))
+        self.assertTrue(
+            daemon.is_model_capacity_error(
+                "stream disconnected before completion: Upstream request failed"
+            )
+        )
         self.assertFalse(daemon.is_model_capacity_error('{"code":"bad_request","message":"capacity field invalid"}'))
+
+    def test_desktop_upstream_wrapper_triggers_high_to_medium_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_config": str(Path(tmp) / "missing.toml"), "model_retry_jitter_seconds": 0})
+            watcher = daemon.Watcher(config, dry_run=True)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            record = {
+                "title": "桌面端上游失败",
+                "cwd": tmp,
+                "path": str(Path(tmp) / "rollout.jsonl"),
+                "reasoning_effort": "high",
+            }
+            scheduled = watcher.schedule_retry(
+                thread_id,
+                {
+                    "turn_id": "turn-desktop-upstream",
+                    "error": {
+                        "message": "stream disconnected before completion: Upstream request failed"
+                    },
+                },
+                record,
+                1000,
+                "retryable_error",
+            )
+            self.assertTrue(scheduled)
+            item = watcher.state["scheduled_retries"][0]
+            self.assertEqual(item["reasoning_effort"], "medium")
+            self.assertEqual(item["reasoning_fallback_from"], "high")
 
     def test_capacity_error_schedules_exponential_backoff(self):
         with tempfile.TemporaryDirectory() as tmp:

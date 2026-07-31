@@ -39,10 +39,10 @@ PROVIDERS_PATH = APP_HOME / "providers.json"
 EXCHANGE_RATE_CACHE_PATH = APP_HOME / "exchange-rate.json"
 
 DEFAULT_CONFIG = {
-    "config_schema_version": 6,
+    "config_schema_version": 7,
     "cc_switch_log": str(Path.home() / ".cc-switch" / "logs" / "cc-switch.log"),
     "cc_switch_db": str(Path.home() / ".cc-switch" / "cc-switch.db"),
-    "codex_state_db": str(Path.home() / ".codex" / "sqlite" / "state_5.sqlite"),
+    "codex_state_db": str(Path.home() / ".codex" / "state_5.sqlite"),
     "codex_sessions_dir": str(Path.home() / ".codex" / "sessions"),
     "codex_config": str(Path.home() / ".codex" / "config.toml"),
     "codex_proxy_backup": str(Path.home() / ".codex" / "config.toml.before-codex-resumer"),
@@ -97,6 +97,8 @@ DEFAULT_CONFIG = {
     "gateway_400_failover_bypass_enabled": True,
     "gateway_400_failover_bypass_seconds": 900,
 }
+
+_WARNING_THROTTLE = {}
 
 REASONING_EFFORT_ORDER = ("minimal", "low", "medium", "high", "xhigh")
 REASONING_EFFORT_LABELS = {
@@ -693,6 +695,10 @@ def is_model_capacity_error(text):
         or "model is at capacity" in lowered
         or "server_overloaded" in lowered
         or "model overloaded" in lowered
+        # Codex Desktop can hide the upstream capacity response behind this
+        # stream error. Treat the exact wrapper as effort-sensitive so the
+        # unattended resume tries the next lower reasoning tier.
+        or "stream disconnected before completion: upstream request failed" in lowered
     )
 
 
@@ -1014,7 +1020,7 @@ def query_usd_cny_rate(timeout=5):
     )
     for endpoint, extract in endpoints:
         try:
-            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "CodexCircuitResumer/2.5.5"})
+            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "CodexCircuitResumer/2.5.7"})
             with urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             rate = extract(payload)
@@ -1135,7 +1141,7 @@ def query_sub2api_billing(base_url, api_key, timeout=8):
         headers={
             "Authorization": "Bearer " + api_key,
             "Accept": "application/json",
-            "User-Agent": "CodexCircuitResumer/2.5.5",
+            "User-Agent": "CodexCircuitResumer/2.5.7",
         },
     )
     try:
@@ -1588,36 +1594,82 @@ def valid_thread_id(value):
     return bool(value and THREAD_ID_RE.match(str(value)))
 
 
+def codex_state_db_candidates(config, home=None):
+    """Return state DB candidates without overriding an explicit custom path.
+
+    Codex Desktop moved ``state_5.sqlite`` from ``~/.codex/sqlite`` to
+    ``~/.codex``.  Existing installations can therefore still carry the old
+    generated default even though the live thread index is now at the new
+    location.  Only those two known defaults are auto-resolved; any other path
+    is treated as a deliberate user customization.
+    """
+    home = Path(home) if home is not None else Path.home()
+    modern = home / ".codex" / "state_5.sqlite"
+    legacy = home / ".codex" / "sqlite" / "state_5.sqlite"
+    configured_text = str(config.get("codex_state_db") or modern)
+    configured = Path(configured_text).expanduser()
+    if configured not in {modern, legacy}:
+        return [configured]
+    return [modern, legacy]
+
+
+def resolve_codex_state_db(config, home=None):
+    candidates = codex_state_db_candidates(config, home=home)
+    return next((path for path in candidates if path.is_file()), candidates[0])
+
+
+def warning_throttled(key, message, *args, interval=300):
+    """Log a recurring warning at most once per interval."""
+    now = time.monotonic()
+    last = _WARNING_THROTTLE.get(key)
+    if last is not None and now - last < interval:
+        return False
+    _WARNING_THROTTLE[key] = now
+    logging.warning(message, *args)
+    return True
+
+
 def thread_paths_from_db(config, thread_ids):
-    result = {}
-    db_path = config["codex_state_db"]
-    if not thread_ids or not os.path.exists(db_path):
-        return result
+    if not thread_ids:
+        return {}
     placeholders = ",".join("?" for _ in thread_ids)
-    uri = "file:{}?mode=ro".format(db_path)
-    try:
-        with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
-            columns = {row[1] for row in db.execute("PRAGMA table_info(threads)").fetchall()}
-            effort_column = ", reasoning_effort" if "reasoning_effort" in columns else ""
-            rows = db.execute(
-                "SELECT id, rollout_path, cwd, title{} FROM threads WHERE id IN ({})".format(
-                    effort_column, placeholders
-                ),
-                list(thread_ids),
-            ).fetchall()
-        for row in rows:
-            thread_id, rollout_path, cwd, title = row[:4]
-            reasoning_effort = row[4] if len(row) > 4 else None
-            result[thread_id] = {
-                "path": rollout_path,
-                "cwd": cwd,
-                "title": title or thread_id,
-            }
-            if normalize_reasoning_effort(reasoning_effort):
-                result[thread_id]["reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
-    except sqlite3.Error as exc:
-        logging.warning("cannot query Codex state DB: %s", exc)
-    return result
+    errors = []
+    for db_path in codex_state_db_candidates(config):
+        if not db_path.is_file():
+            continue
+        result = {}
+        try:
+            uri = db_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(threads)").fetchall()}
+                effort_column = ", reasoning_effort" if "reasoning_effort" in columns else ""
+                rows = db.execute(
+                    "SELECT id, rollout_path, cwd, title{} FROM threads WHERE id IN ({})".format(
+                        effort_column, placeholders
+                    ),
+                    list(thread_ids),
+                ).fetchall()
+            for row in rows:
+                thread_id, rollout_path, cwd, title = row[:4]
+                reasoning_effort = row[4] if len(row) > 4 else None
+                result[thread_id] = {
+                    "path": rollout_path,
+                    "cwd": cwd,
+                    "title": title or thread_id,
+                }
+                if normalize_reasoning_effort(reasoning_effort):
+                    result[thread_id]["reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
+            _WARNING_THROTTLE.pop("codex-state-db", None)
+            return result
+        except sqlite3.Error as exc:
+            errors.append("{}: {}".format(db_path, exc))
+    if errors:
+        warning_throttled(
+            "codex-state-db",
+            "cannot query Codex state DB: %s",
+            "; ".join(errors),
+        )
+    return {}
 
 
 def fallback_thread_path(config, thread_id):

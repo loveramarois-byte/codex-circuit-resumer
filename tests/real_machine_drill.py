@@ -98,7 +98,11 @@ def retry_detection_drill(index, error_message):
         scheduled = state.get("scheduled_retries") or []
         if len(scheduled) != 1 or scheduled[0].get("turn_id") != "turn-{}".format(index):
             raise AssertionError("retry was not durably scheduled")
-        if "at capacity" in error_message and scheduled[0].get("reasoning_effort") != "medium":
+        capacity_wrappers = (
+            "at capacity" in error_message
+            or "stream disconnected before completion: upstream request failed" in error_message.lower()
+        )
+        if capacity_wrappers and scheduled[0].get("reasoning_effort") != "medium":
             raise AssertionError("capacity retry did not fall back from high to medium")
 
 
@@ -224,8 +228,13 @@ def main():
     failures = []
 
     drills = []
+    retry_errors = (
+        "Selected model is at capacity",
+        "stream disconnected before completion: Upstream request failed",
+        "relay.example 503 temporarily unavailable",
+    )
     for index in range(15):
-        error = "Selected model is at capacity" if index % 2 == 0 else "relay.example 503 temporarily unavailable"
+        error = retry_errors[index % len(retry_errors)]
         drills.append(("故障续接", lambda index=index, error=error: retry_detection_drill(index, error)))
     drills.extend(("HTML400换线", lambda index=index: gateway_bypass_drill(index)) for index in range(5))
     drills.extend(("真实渠道", provider_snapshot_drill) for _ in range(10))

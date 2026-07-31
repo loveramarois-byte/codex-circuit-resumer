@@ -74,6 +74,12 @@ if old_version < 6:
     current["capacity_reasoning_promote_enabled"] = bool(current.get("capacity_reasoning_promote_enabled", True))
     current["capacity_reasoning_promote_after_seconds"] = int(current.get("capacity_reasoning_promote_after_seconds") or 900)
     current["config_schema_version"] = 6
+if old_version < 7:
+    legacy_state_db = str(Path.home() / ".codex" / "sqlite" / "state_5.sqlite")
+    configured_state_db = str(current.get("codex_state_db") or "")
+    if configured_state_db in {legacy_state_db, "~/.codex/sqlite/state_5.sqlite"}:
+        current["codex_state_db"] = "~/.codex/state_5.sqlite"
+    current["config_schema_version"] = 7
 merged = dict(defaults)
 merged.update(current)
 config_path.parent.mkdir(parents=True, exist_ok=True)

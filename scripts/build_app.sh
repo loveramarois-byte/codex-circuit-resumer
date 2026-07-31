@@ -4,11 +4,25 @@ set -eu
 SCRIPT_DIR="${0:A:h}"
 PROJECT_DIR="${SCRIPT_DIR:h}"
 DESTINATION="${1:-$PROJECT_DIR/dist/Codex熔断续聊.app}"
+DESTINATION="${DESTINATION:A}"
 CONTENTS="$DESTINATION/Contents"
 RESOURCES="$CONTENTS/Resources"
 MACOS="$CONTENTS/MacOS"
 ICONSET="$PROJECT_DIR/.build/CodexCircuitResumer.iconset"
 CIRCUIT_BUILD_CACHE="${TMPDIR:-/tmp}/codex-circuit-resumer-build-cache"
+APP_EXECUTABLE="$DESTINATION/Contents/MacOS/CodexCircuitResumer"
+
+app_is_running() {
+  /bin/ps -axo command= | /usr/bin/awk -v target="$APP_EXECUTABLE" '
+    $0 == target || index($0, target " ") == 1 { found = 1 }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
+was_running=0
+if app_is_running; then
+  was_running=1
+fi
 
 mkdir -p "${DESTINATION:h}"
 mkdir -p "$CIRCUIT_BUILD_CACHE"
@@ -36,8 +50,8 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Codex 熔断续聊</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>2.5.5</string>
-  <key>CFBundleVersion</key><string>255</string>
+  <key>CFBundleShortVersionString</key><string>2.5.7</string>
+  <key>CFBundleVersion</key><string>257</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -65,5 +79,19 @@ cp "$PROJECT_DIR/config.example.json" "$RESOURCES/config.example.json"
 chmod 755 "$RESOURCES/control.sh" "$RESOURCES/daemon.py"
 /usr/bin/codesign --force --deep --sign - "$DESTINATION" >/dev/null
 /usr/bin/xattr -cr "$DESTINATION" 2>/dev/null || true
+
+# Replacing an app bundle does not replace an already running process. Restart
+# only when this exact destination was open before the build, so the user sees
+# the new UI immediately without touching the background LaunchAgent.
+if (( was_running )); then
+  /usr/bin/osascript -e 'tell application id "local.codex.circuitresumer" to quit' >/dev/null 2>&1 || true
+  for _ in {1..50}; do
+    if ! app_is_running; then
+      break
+    fi
+    /bin/sleep 0.1
+  done
+  /usr/bin/open "$DESTINATION"
+fi
 
 echo "$DESTINATION"

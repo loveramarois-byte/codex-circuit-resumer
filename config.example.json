@@ -1,5 +1,6 @@
 {
-  "config_schema_version": 6,
+  "config_schema_version": 7,
+  "codex_state_db": "~/.codex/state_5.sqlite",
   "recovery_grace_seconds": 20,
   "active_thread_idle_seconds": 240,
   "poll_seconds": 2,
