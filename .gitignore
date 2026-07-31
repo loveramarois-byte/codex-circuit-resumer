@@ -1,0 +1,14 @@
+.DS_Store
+.build/
+dist/
+work/
+*.app
+*.app.old.*
+*.zip
+__pycache__/
+*.py[cod]
+*.log
+.local-backups/
+.env
+.env.*
+!.env.example

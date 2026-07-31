@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Python and configuration
+        run: |
+          python3 -m unittest discover -s tests -v
+          python3 -m py_compile src/daemon.py tests/real_machine_drill.py
+          jq empty config.example.json
+          zsh -n scripts/control.sh scripts/build_app.sh
+
+      - name: Build macOS app
+        run: |
+          ./scripts/build_app.sh "$RUNNER_TEMP/CodexCircuitResumer.app"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/CodexCircuitResumer.app"
