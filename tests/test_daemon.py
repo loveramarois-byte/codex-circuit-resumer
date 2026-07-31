@@ -329,6 +329,55 @@ class DetectionTests(unittest.TestCase):
             self.assertEqual(len(ready), 1)
             self.assertEqual(pending, [])
 
+    def test_recovery_keeps_candidates_beyond_launch_batch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = int(time.time())
+            cc_db = root / "cc.db"
+            state_db = root / "state.db"
+            with sqlite3.connect(str(cc_db)) as log_db, sqlite3.connect(str(state_db)) as state_db_connection:
+                log_db.execute("CREATE TABLE proxy_request_logs (app_type TEXT, created_at INTEGER, status_code INTEGER, session_id TEXT)")
+                state_db_connection.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
+                for index in range(3):
+                    thread_id = "019fb64d-d041-7842-adbf-01b165ad1b{:02x}".format(index)
+                    rollout = root / ("rollout-" + thread_id + ".jsonl")
+                    write_events(rollout, [
+                        event("task_started", turn_id="turn-{}".format(index)),
+                        event("task_complete", turn_id="turn-{}".format(index), last_agent_message=None,
+                              error={"codex_error_info": "server_overloaded"}),
+                    ])
+                    os.utime(str(rollout), (now, now))
+                    state_db_connection.execute("INSERT INTO threads VALUES (?, ?, ?, ?)", (thread_id, str(rollout), str(root), "任务 {}".format(index)))
+                    log_db.execute("INSERT INTO proxy_request_logs VALUES ('codex', ?, 503, ?)", (now, thread_id))
+            with isolated_runtime(root):
+                config = dict(daemon.DEFAULT_CONFIG)
+                config.update({"cc_switch_db": str(cc_db), "codex_state_db": str(state_db), "codex_sessions_dir": str(root),
+                               "max_candidates_per_incident": 2, "recovery_grace_seconds": 0, "notify": False})
+                watcher = daemon.Watcher(config, dry_run=True)
+                opened = now - 2
+                watcher.handle_open(opened, "熔断器 Closed → Open")
+                watcher.handle_closed(now - 1, "熔断器 HalfOpen → Closed")
+                watcher.prepare_queue_if_ready(now)
+                self.assertEqual(len(watcher.state["queue"]), 2)
+                self.assertEqual(len(watcher.state["candidate_backlog"]), 1)
+                watcher.launch_next(now)
+                watcher.launch_next(now)
+                watcher.launch_next(now)
+                self.assertEqual(watcher.state["phase"], "resuming")
+                self.assertEqual(len(watcher.state["candidate_backlog"]), 0)
+
+    def test_maintenance_uses_hours_not_double_hours(self):
+        state = daemon.initial_state()
+        now = 200000
+        state["last_cleanup_at"] = 0
+        state["resumed_turns"] = {"old": {"resumed_at": now - 86401}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with isolated_runtime(Path(tmp)):
+                watcher = daemon.Watcher({**daemon.DEFAULT_CONFIG, "model_retry_watch_hours": 24}, dry_run=True)
+                watcher.state = state
+                watcher.maintenance(now)
+                self.assertNotIn("old", watcher.state["resumed_turns"])
+
     def test_runtime_path_contains_user_node_locations(self):
         config = dict(daemon.DEFAULT_CONFIG)
         joined = os.pathsep.join(config["extra_path"])
@@ -1251,6 +1300,34 @@ class ExchangeRateTests(unittest.TestCase):
 
 
 class ProviderSnapshotTests(unittest.TestCase):
+    def test_legacy_provider_schema_and_one_x_logged_multiplier_are_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = int(time.time())
+            cc_db = root / "legacy.db"
+            with sqlite3.connect(str(cc_db)) as db:
+                db.execute("CREATE TABLE providers (id TEXT, name TEXT, app_type TEXT)")
+                db.execute(
+                    "CREATE TABLE proxy_request_logs (provider_id TEXT, app_type TEXT, status_code INTEGER, "
+                    "latency_ms INTEGER, created_at INTEGER, error_message TEXT, model TEXT, request_model TEXT, "
+                    "total_cost_usd TEXT, cost_multiplier TEXT)"
+                )
+                db.execute("INSERT INTO providers VALUES ('legacy','Legacy-0.08','codex')")
+                db.execute(
+                    "INSERT INTO proxy_request_logs VALUES ('legacy','codex',200,500,?,'','gpt','gpt','2','1.0')",
+                    (now,),
+                )
+            config = {**daemon.DEFAULT_CONFIG, "cc_switch_db": str(cc_db)}
+            state = daemon.initial_state()
+            state["billing_cache"] = {"codex:legacy": {"status": "error", "detail": "temporary timeout"}}
+            snapshot = daemon.build_provider_snapshot(config, state, now=now)
+            self.assertIsNone(snapshot["error"])
+            self.assertEqual(len(snapshot["providers"]), 1)
+            provider = snapshot["providers"][0]
+            self.assertEqual(provider["actual_multiplier"], 1.0)
+            self.assertEqual(provider["actual_multiplier_source"], "请求记录")
+            self.assertTrue(provider["multiplier_changed"])
+
     def test_anthropic_provider_config_is_detected_without_exposing_key(self):
         config = json.dumps({
             "env": {

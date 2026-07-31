@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use semantic versioning where practical.
 
+## [2.6.0] - 2026-08-01
+
+### Added
+
+- Persist overflow recovery candidates and process them in safe batches so large incidents cannot silently lose conversations.
+- Discover Codex and CC Switch by bundle identifier before falling back to common install locations.
+- Read older CC Switch provider schemas even when optional provider or health fields are absent.
+
+### Changed
+
+- Move periodic file reads and `launchctl` checks off the SwiftUI main thread, and tail only the recent event log window.
+- Treat an explicit `1.0` request multiplier as a valid observed multiplier for cost reconciliation.
+- Count deferred recovery candidates in the visible pending queue.
+
+### Fixed
+
+- Correct retry-history cleanup from two hours per configured hour to one hour per configured hour.
+
+### Verified
+
+- 63 unit tests, Swift type checking, app signing checks, and 50 process-level macOS drills.
+
 ## [2.5.7] - 2026-08-01
 
 ### Fixed

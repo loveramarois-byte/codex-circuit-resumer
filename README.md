@@ -3,7 +3,7 @@
 [![CI](https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml/badge.svg)](https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)](#环境要求)
-[![Release](https://img.shields.io/badge/release-2.5.7-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-2.6.0-blue)](CHANGELOG.md)
 
 一个面向 macOS、CC Switch 与 Codex Desktop 的本地守望工具。它监控中转线路熔断、模型池满载和临时网关故障，在条件恢复后继续原 Codex 对话，并提供渠道健康、真实倍率、人民币费用及 Claude Desktop 渠道状态总览。
 
@@ -148,6 +148,7 @@ open "dist/Codex熔断续聊.app"
 | `capacity_reasoning_minimum` | `low` | 自动降档最低档位 |
 | `capacity_reasoning_promote_enabled` | `true` | 定期尝试恢复原推理强度 |
 | `capacity_reasoning_promote_after_seconds` | `900` | 恢复探测间隔 |
+| `max_candidates_per_incident` | `8` | 每批续接数量；超过后自动排队，不会丢失 |
 | `provider_snapshot_seconds` | `30` | 渠道与费用快照间隔 |
 
 ## 项目优点

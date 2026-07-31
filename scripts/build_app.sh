@@ -50,8 +50,8 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Codex 熔断续聊</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>2.5.7</string>
-  <key>CFBundleVersion</key><string>257</string>
+  <key>CFBundleShortVersionString</key><string>2.6.0</string>
+  <key>CFBundleVersion</key><string>260</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>

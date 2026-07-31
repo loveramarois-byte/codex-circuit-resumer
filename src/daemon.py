@@ -197,6 +197,7 @@ def initial_state():
         "log_offset": 0,
         "incident": None,
         "queue": [],
+        "candidate_backlog": [],
         "resumed_turns": {},
         "last_event": "等待 CC Switch 熔断事件",
         "last_event_at": int(time.time()),
@@ -266,7 +267,7 @@ def load_state():
     for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures"):
         if not isinstance(base.get(key), dict):
             base[key] = {}
-    for key in ("queue", "scheduled_retries", "temporary_failover_bypasses"):
+    for key in ("queue", "candidate_backlog", "scheduled_retries", "temporary_failover_bypasses"):
         if not isinstance(base.get(key), list):
             base[key] = []
     if base.get("phase") not in {"idle", "circuit_open", "recovery_grace", "resuming"}:
@@ -778,6 +779,8 @@ def resolve_codex_binary(config):
     native_candidates = [
         "/Applications/ChatGPT.app/Contents/Resources/codex",
         "/Applications/Codex.app/Contents/Resources/codex",
+        str(Path.home() / "Applications" / "ChatGPT.app" / "Contents" / "Resources" / "codex"),
+        str(Path.home() / "Applications" / "Codex.app" / "Contents" / "Resources" / "codex"),
     ]
     configured = str(config.get("codex_binary") or "")
     candidates = native_candidates + [configured] if config.get("prefer_native_codex", True) else [configured] + native_candidates
@@ -1020,7 +1023,7 @@ def query_usd_cny_rate(timeout=5):
     )
     for endpoint, extract in endpoints:
         try:
-            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "CodexCircuitResumer/2.5.7"})
+            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "CodexCircuitResumer/2.6.0"})
             with urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             rate = extract(payload)
@@ -1141,7 +1144,7 @@ def query_sub2api_billing(base_url, api_key, timeout=8):
         headers={
             "Authorization": "Bearer " + api_key,
             "Accept": "application/json",
-            "User-Agent": "CodexCircuitResumer/2.5.7",
+            "User-Agent": "CodexCircuitResumer/2.6.0",
         },
     )
     try:
@@ -1192,6 +1195,18 @@ def numeric_multiplier(value):
         return None
 
 
+def sqlite_columns(db, table):
+    """Read a table's columns without assuming one CC Switch schema version."""
+    try:
+        return {row[1] for row in db.execute("PRAGMA table_info({})".format(table)).fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
+def optional_sql_column(alias, columns, name, fallback):
+    return "{}.{}".format(alias, name) if name in columns else fallback
+
+
 def local_day_start(timestamp):
     local = time.localtime(timestamp)
     return int(time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, -1, -1, -1)))
@@ -1237,9 +1252,31 @@ def build_provider_snapshot(
     try:
         with sqlite3.connect(uri, uri=True, timeout=3.0) as db:
             db.row_factory = sqlite3.Row
-            log_columns = {row[1] for row in db.execute("PRAGMA table_info(proxy_request_logs)").fetchall()}
-            provider_columns = {row[1] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
-            provider_created_expr = "p.created_at" if "created_at" in provider_columns else "p.name"
+            log_columns = sqlite_columns(db, "proxy_request_logs")
+            provider_columns = sqlite_columns(db, "providers")
+            health_columns = sqlite_columns(db, "provider_health")
+            if not {"id", "name", "app_type"}.issubset(provider_columns):
+                return {
+                    "generated_at": now,
+                    "providers": [],
+                    "error": "CC Switch providers 表缺少 id、name 或 app_type 字段",
+                    "usd_cny_rate": usd_cny_rate,
+                    "exchange_rate_updated_at": exchange["updated_at"],
+                    "exchange_rate_source": exchange["source"],
+                }
+            provider_created_expr = optional_sql_column("p", provider_columns, "created_at", "p.name")
+            provider_settings_expr = optional_sql_column("p", provider_columns, "settings_config", "''")
+            provider_website_expr = optional_sql_column("p", provider_columns, "website_url", "''")
+            provider_current_expr = optional_sql_column("p", provider_columns, "is_current", "0")
+            provider_queue_expr = optional_sql_column("p", provider_columns, "in_failover_queue", "0")
+            provider_sort_expr = optional_sql_column("p", provider_columns, "sort_index", "NULL")
+            provider_multiplier_expr = optional_sql_column("p", provider_columns, "cost_multiplier", "'1.0'")
+            provider_type_expr = optional_sql_column("p", provider_columns, "provider_type", "''")
+            health_join = ""
+            health_expr = {name: "NULL" for name in ("is_healthy", "consecutive_failures", "last_success_at", "last_failure_at", "last_error")}
+            if {"provider_id", "app_type"}.issubset(health_columns):
+                health_join = "LEFT JOIN provider_health h ON h.provider_id=p.id AND h.app_type=p.app_type"
+                health_expr = {name: optional_sql_column("h", health_columns, name, "NULL") for name in health_expr}
             row_cost_expr = "CAST(total_cost_usd AS REAL)" if "total_cost_usd" in log_columns else "0"
             cost_24h_expr = "ROUND(SUM({}), 8)".format(row_cost_expr)
             cost_today_expr = "ROUND(SUM(CASE WHEN created_at>=? THEN {} ELSE 0 END), 8)".format(row_cost_expr)
@@ -1247,31 +1284,53 @@ def build_provider_snapshot(
             relay_predicate = "COALESCE(data_source,'proxy')='proxy'" if "data_source" in log_columns else "1=1"
             providers = db.execute(
                 """
-                SELECT p.id,p.app_type,p.name,p.settings_config,p.website_url,p.is_current,p.in_failover_queue,p.sort_index,
-                       p.cost_multiplier,p.provider_type,
-                       h.is_healthy,h.consecutive_failures,h.last_success_at,h.last_failure_at,h.last_error
+                SELECT p.id,p.app_type,p.name,{settings},{website},{current},{queue},{sort},
+                       {multiplier},{provider_type},
+                       {is_healthy},{consecutive_failures},{last_success_at},{last_failure_at},{last_error}
                 FROM providers p
-                LEFT JOIN provider_health h ON h.provider_id=p.id AND h.app_type=p.app_type
+                {health_join}
                 WHERE p.app_type IN ('codex','claude-desktop')
                 ORDER BY CASE p.app_type WHEN 'codex' THEN 0 ELSE 1 END,
-                         CASE WHEN p.sort_index IS NULL THEN 1 ELSE 0 END,
-                         p.sort_index ASC,{} ASC,p.name ASC
-                """.format(provider_created_expr)
+                         CASE WHEN {sort} IS NULL THEN 1 ELSE 0 END,
+                         {sort} ASC,{created} ASC,p.name ASC
+                """.format(
+                    settings=provider_settings_expr,
+                    website=provider_website_expr,
+                    current=provider_current_expr,
+                    queue=provider_queue_expr,
+                    sort=provider_sort_expr,
+                    multiplier=provider_multiplier_expr,
+                    provider_type=provider_type_expr,
+                    is_healthy=health_expr["is_healthy"],
+                    consecutive_failures=health_expr["consecutive_failures"],
+                    last_success_at=health_expr["last_success_at"],
+                    last_failure_at=health_expr["last_failure_at"],
+                    last_error=health_expr["last_error"],
+                    health_join=health_join,
+                    created=provider_created_expr,
+                )
             ).fetchall()
-            stats_rows = db.execute(
-                """
-                SELECT app_type,provider_id,COUNT(*) requests,
-                       SUM(CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 ELSE 0 END) successes,
-                       ROUND(AVG(CASE WHEN status_code BETWEEN 200 AND 399 THEN latency_ms END)) avg_latency,
-                       MAX(created_at) last_request_at,
-                       {} standard_cost_today_usd,
-                       {} standard_cost_24h_usd
-                FROM proxy_request_logs
-                WHERE app_type IN ('codex','claude-desktop') AND created_at>=?
-                GROUP BY app_type,provider_id
-                """.format(cost_today_expr, cost_24h_expr),
-                (day_start, now - 86400,),
-            ).fetchall()
+            log_usable = {
+                "app_type", "provider_id", "status_code", "created_at",
+                "latency_ms", "error_message", "model", "request_model",
+            }.issubset(log_columns)
+            if log_usable:
+                stats_rows = db.execute(
+                    """
+                    SELECT app_type,provider_id,COUNT(*) requests,
+                           SUM(CASE WHEN status_code BETWEEN 200 AND 399 THEN 1 ELSE 0 END) successes,
+                           ROUND(AVG(CASE WHEN status_code BETWEEN 200 AND 399 THEN latency_ms END)) avg_latency,
+                           MAX(created_at) last_request_at,
+                           {} standard_cost_today_usd,
+                           {} standard_cost_24h_usd
+                    FROM proxy_request_logs
+                    WHERE app_type IN ('codex','claude-desktop') AND created_at>=?
+                    GROUP BY app_type,provider_id
+                    """.format(cost_today_expr, cost_24h_expr),
+                    (day_start, now - 86400,),
+                ).fetchall()
+            else:
+                stats_rows = []
             if "total_cost_usd" in log_columns:
                 total_rows = db.execute(
                     """
@@ -1280,7 +1339,7 @@ def build_provider_snapshot(
                     WHERE app_type IN ('codex','claude-desktop')
                     GROUP BY app_type,provider_id
                     """
-                ).fetchall()
+                ).fetchall() if log_usable else []
             else:
                 total_rows = []
             latest_rows = db.execute(
@@ -1294,7 +1353,7 @@ def build_provider_snapshot(
                 ) newest ON newest.app_type=l.app_type AND newest.provider_id=l.provider_id AND newest.created_at=l.created_at
                 WHERE l.app_type IN ('codex','claude-desktop')
                 """.format(latest_multiplier_expr)
-            ).fetchall()
+            ).fetchall() if log_usable else []
             usage_rows = db.execute(
                 """
                 SELECT app_type,
@@ -1307,7 +1366,8 @@ def build_provider_snapshot(
                 GROUP BY app_type
                 """.format(cost=row_cost_expr, relay=relay_predicate),
                 (day_start, day_start),
-            ).fetchall()
+            ).fetchall() if log_usable else []
+            snapshot_warning = None if log_usable else "CC Switch 请求日志表缺少可识别字段，费用与健康记录暂不可用"
     except sqlite3.Error as exc:
         return {"generated_at": now, "providers": [], "error": str(exc)}
 
@@ -1413,17 +1473,18 @@ def build_provider_snapshot(
         actual_multiplier_state = "unknown"
         if billing and billing.get("status") == "ok":
             actual_multiplier = numeric_multiplier(billing.get("effective_multiplier"))
-            actual_multiplier_source = "网站实测"
-            actual_multiplier_state = "verified"
-        elif billing and billing.get("status") == "error":
-            actual_multiplier_source = "查询失败"
-            actual_multiplier_state = "error"
-        else:
+            if actual_multiplier is not None:
+                actual_multiplier_source = "网站实测"
+                actual_multiplier_state = "verified"
+        if actual_multiplier is None:
             logged_multiplier = numeric_multiplier(last.get("logged_multiplier"))
-            if logged_multiplier is not None and abs(logged_multiplier - 1.0) > 0.000001:
+            if logged_multiplier is not None:
                 actual_multiplier = logged_multiplier
                 actual_multiplier_source = "请求记录"
                 actual_multiplier_state = "observed"
+            elif billing and billing.get("status") == "error":
+                actual_multiplier_source = "查询失败"
+                actual_multiplier_state = "error"
         remarked_number = numeric_multiplier(remarked_multiplier)
         multiplier_changed = (
             actual_multiplier is not None
@@ -1555,7 +1616,7 @@ def build_provider_snapshot(
     return {
         "generated_at": now,
         "providers": output,
-        "error": None,
+        "error": snapshot_warning,
         "total_standard_cost_24h_usd": round(total_standard_24h, 8),
         "total_standard_cost_all_usd": round(total_standard_all, 8),
         "total_estimated_actual_cost_24h_usd": round(total_estimated_24h, 8),
@@ -1794,8 +1855,10 @@ def build_candidates(config, incident, state, now=None, include_pending=False):
         remembered_effort = state.get("reasoning_efforts", {}).get(thread_id)
         if normalize_reasoning_effort(remembered_effort):
             candidates[-1]["reasoning_effort"] = normalize_reasoning_effort(remembered_effort)
-    ready = candidates[: int(config["max_candidates_per_incident"])]
-    return (ready, pending) if include_pending else ready
+    # The configured limit is a launch batch size, not a hard incident cap.
+    # Returning every candidate lets the watcher persist overflow work and
+    # process it after the first batch drains instead of silently dropping it.
+    return (candidates, pending) if include_pending else candidates
 
 
 def notify(title, body):
@@ -1986,7 +2049,7 @@ class Watcher:
         if now - last_cleanup < 3600:
             return
         self.state["last_cleanup_at"] = now
-        cutoff = now - max(86400, int(float(self.config.get("model_retry_watch_hours", 24)) * 7200))
+        cutoff = now - max(86400, int(float(self.config.get("model_retry_watch_hours", 24)) * 3600))
         resumed = self.state.setdefault("resumed_turns", {})
         for turn_id, item in list(resumed.items()):
             if int(item.get("resumed_at") or 0) < cutoff:
@@ -2007,6 +2070,7 @@ class Watcher:
             "source_line": line.strip()[-500:],
         }
         self.state["queue"] = []
+        self.state["candidate_backlog"] = []
         self.set_event("检测到 CC Switch 熔断，开始记录受影响任务", when)
         save_state(self.state)
 
@@ -2087,10 +2151,20 @@ class Watcher:
         candidates, pending = build_candidates(
             self.config, incident, self.state, now, include_pending=True
         )
-        self.state["queue"] = candidates
-        if candidates:
+        batch_size = max(1, int(self.config.get("max_candidates_per_incident", 8)))
+        self.state["queue"] = candidates[:batch_size]
+        self.state["candidate_backlog"] = candidates[batch_size:]
+        if self.state["queue"]:
             self.state["phase"] = "resuming"
-            self.set_event("找到 {} 条中断任务，开始串行续接".format(len(candidates)), now)
+            total = len(candidates)
+            queued = len(self.state["queue"])
+            remaining = len(self.state["candidate_backlog"])
+            message = "找到 {} 条中断任务，开始串行续接".format(total)
+            if remaining:
+                message = "找到 {} 条中断任务，先续接 {} 条，另有 {} 条已安全排队".format(
+                    total, queued, remaining
+                )
+            self.set_event(message, now)
         elif pending:
             self.set_event(
                 "线路已恢复，继续观察 {} 条尚未结束的任务".format(len(pending)), now
@@ -2486,12 +2560,27 @@ class Watcher:
             return
         queue = self.state.get("queue") or []
         if not queue:
-            if not inflight:
+            backlog = self.state.setdefault("candidate_backlog", [])
+            if backlog and not inflight:
+                batch_size = max(1, int(self.config.get("max_candidates_per_incident", 8)))
+                self.state["queue"] = backlog[:batch_size]
+                self.state["candidate_backlog"] = backlog[batch_size:]
+                queue = self.state["queue"]
+                self.set_event(
+                    "继续处理剩余中断任务：本批 {} 条，尚余 {} 条".format(
+                        len(queue), len(self.state["candidate_backlog"])
+                    ),
+                    now,
+                )
+            if queue:
+                save_state(self.state)
+            elif not inflight:
                 self.state["phase"] = "idle"
                 self.state["incident"] = None
                 self.set_event("本轮中断任务已全部处理", now)
                 save_state(self.state)
-            return
+            if not queue:
+                return
 
         if not self.dry_run:
             retry_at = int(self.state.get("proxy_route_retry_at") or 0)

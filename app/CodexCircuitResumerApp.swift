@@ -25,6 +25,13 @@ private struct CommandResult: Sendable {
     let output: String
 }
 
+private struct RefreshPayload: Sendable {
+    let stateData: Data?
+    let eventData: Data?
+    let providerData: Data?
+    let launchAgentLoaded: Bool
+}
+
 private enum Page: String, CaseIterable, Identifiable {
     case overview = "总览"
     case channels = "渠道"
@@ -376,6 +383,14 @@ private final class AppModel: ObservableObject {
     private var configObject: [String: Any] = [:]
     private var didLoadSettings = false
     private var didBegin = false
+    private var refreshTask: Task<Void, Never>?
+    private var refreshRequestTask: Task<Void, Never>?
+    private var refreshGeneration = 0
+
+    deinit {
+        refreshTask?.cancel()
+        refreshRequestTask?.cancel()
+    }
 
     var filteredProviders: [ProviderInfo] {
         providers.filter { ($0.appType ?? "codex") == selectedChannelApp }
@@ -520,21 +535,55 @@ private final class AppModel: ObservableObject {
         didBegin = true
         refresh()
         loadSettings()
-        Task {
+        refreshTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                refresh()
+                guard let self else { return }
+                await self.refreshInBackground()
             }
         }
     }
 
     func refresh() {
-        let state = readJSON(stateURL)
+        refreshGeneration += 1
+        let generation = refreshGeneration
+        refreshRequestTask?.cancel()
+        refreshRequestTask = Task { [weak self] in
+            guard let self else { return }
+            let payload = await self.loadRefreshPayload()
+            guard !Task.isCancelled else { return }
+            self.apply(payload, generation: generation)
+        }
+    }
+
+    private func refreshInBackground() async {
+        let generation = refreshGeneration
+        let payload = await loadRefreshPayload()
+        guard !Task.isCancelled else { return }
+        apply(payload, generation: generation)
+    }
+
+    private func loadRefreshPayload() async -> RefreshPayload {
+        await Task.detached(priority: .utility) {
+            RefreshPayload(
+                stateData: try? Data(contentsOf: stateURL),
+                eventData: readTailData(watcherLogURL, maxBytes: 128 * 1024),
+                providerData: try? Data(contentsOf: providersURL),
+                launchAgentLoaded: launchAgentRunningSync()
+            )
+        }.value
+    }
+
+    private func apply(_ payload: RefreshPayload, generation: Int) {
+        guard generation == refreshGeneration else { return }
+        let state = decodeJSON(payload.stateData)
         phase = state["phase"] as? String ?? "idle"
         lastEvent = state["last_event"] as? String ?? "等待 CC Switch 熔断事件"
         lastEventAt = state["last_event_at"] as? Int ?? 0
         resumeCount = state["resume_count"] as? Int ?? 0
-        queueCount = (state["queue"] as? [[String: Any]])?.count ?? 0
+        let activeQueueCount = (state["queue"] as? [[String: Any]])?.count ?? 0
+        let backlogCount = (state["candidate_backlog"] as? [[String: Any]])?.count ?? 0
+        queueCount = activeQueueCount + backlogCount
         let scheduled = state["scheduled_retries"] as? [[String: Any]] ?? []
         scheduledRetryCount = state["scheduled_retry_count"] as? Int ?? scheduled.count
         if let next = scheduled.min(by: { ($0["not_before"] as? Int ?? Int.max) < ($1["not_before"] as? Int ?? Int.max) }) {
@@ -555,12 +604,12 @@ private final class AppModel: ObservableObject {
         let heartbeatAt = state["heartbeat_at"] as? Int ?? 0
         heartbeatAge = heartbeatAt > 0 ? max(0, Int(Date().timeIntervalSince1970) - heartbeatAt) : nil
         isPaused = FileManager.default.fileExists(atPath: pauseURL.path)
-        isLoaded = launchAgentRunning()
+        isLoaded = payload.launchAgentLoaded
         daemonHealthy = isLoaded && (heartbeatAge ?? Int.max) <= 30
         proxyRouteStatus = state["proxy_route_status"] as? String ?? "unchecked"
         proxyRouteDetail = state["proxy_route_detail"] as? String ?? "尚未检查 Codex 是否经过 CC Switch"
-        events = readEvents()
-        readProviderSnapshot()
+        events = readEvents(from: payload.eventData)
+        readProviderSnapshot(from: payload.providerData)
     }
 
     func toggleWatcher() {
@@ -697,7 +746,7 @@ private final class AppModel: ObservableObject {
             return
         }
         guard (1...16).contains(maxCandidates) else {
-            errorMessage = "单次任务上限必须在 1 到 16 之间。"
+            errorMessage = "单批任务上限必须在 1 到 16 之间。"
             return
         }
         guard (30...900).contains(retryBaseSeconds) else {
@@ -791,8 +840,24 @@ private final class AppModel: ObservableObject {
     }
 
     func openLogs() { NSWorkspace.shared.open(appSupport.appendingPathComponent("logs", isDirectory: true)) }
-    func openCodex() { NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/Applications/ChatGPT.app"), configuration: .init()) }
-    func openCCSwitch() { NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: "/Applications/CC Switch.app"), configuration: .init()) }
+    func openCodex() { openApplication(displayName: "Codex", bundleIdentifier: "com.openai.codex", fallbackPaths: ["/Applications/ChatGPT.app", "~/Applications/ChatGPT.app"]) }
+    func openCCSwitch() { openApplication(displayName: "CC Switch", bundleIdentifier: "com.ccswitch.desktop", fallbackPaths: ["/Applications/CC Switch.app", "~/Applications/CC Switch.app"]) }
+
+    private func openApplication(displayName: String, bundleIdentifier: String, fallbackPaths: [String]) {
+        if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier) {
+            NSWorkspace.shared.openApplication(at: url, configuration: .init())
+            return
+        }
+        for path in fallbackPaths {
+            let expanded = (path as NSString).expandingTildeInPath
+            let url = URL(fileURLWithPath: expanded)
+            if FileManager.default.fileExists(atPath: url.path) {
+                NSWorkspace.shared.openApplication(at: url, configuration: .init())
+                return
+            }
+        }
+        errorMessage = "找不到 \(displayName)，请确认已经安装。"
+    }
 
     func copyDiagnostics() {
         let lines = diagnostics.map { "\($0.healthy ? "正常" : "异常") | \($0.name) | \($0.detail)" }
@@ -821,18 +886,26 @@ private final class AppModel: ObservableObject {
         }
     }
 
-    private func readJSON(_ url: URL) -> [String: Any] {
-        guard let data = try? Data(contentsOf: url),
+    private func decodeJSON(_ data: Data?) -> [String: Any] {
+        guard let data,
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
         return object
     }
 
-    private func resolvedCodexBinaryURL() -> URL {
-        FileManager.default.isExecutableFile(atPath: nativeCodexBinaryURL.path) ? nativeCodexBinaryURL : codexBinaryURL
+    private func readJSON(_ url: URL) -> [String: Any] {
+        decodeJSON(try? Data(contentsOf: url))
     }
 
-    private func readProviderSnapshot() {
-        guard let data = try? Data(contentsOf: providersURL) else { return }
+    private func resolvedCodexBinaryURL() -> URL {
+        if let appURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.openai.codex") {
+            let discovered = appURL.appendingPathComponent("Contents/Resources/codex")
+            if FileManager.default.isExecutableFile(atPath: discovered.path) { return discovered }
+        }
+        return FileManager.default.isExecutableFile(atPath: nativeCodexBinaryURL.path) ? nativeCodexBinaryURL : codexBinaryURL
+    }
+
+    private func readProviderSnapshot(from data: Data? = nil) {
+        guard let data = data ?? (try? Data(contentsOf: providersURL)) else { return }
         do {
             let snapshot = try JSONDecoder().decode(ProviderSnapshot.self, from: data)
             providers = snapshot.providers
@@ -857,20 +930,12 @@ private final class AppModel: ObservableObject {
     }
 
     private func launchAgentRunning() -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        process.arguments = ["print", "gui/\(getuid())/com.local.codex-circuit-resumer"]
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-            return process.terminationStatus == 0
-        } catch { return false }
+        launchAgentRunningSync()
     }
 
-    private func readEvents() -> [WatcherEvent] {
-        guard let text = try? String(contentsOf: watcherLogURL, encoding: .utf8) else { return [] }
+    private func readEvents(from data: Data? = nil) -> [WatcherEvent] {
+        guard let data = data ?? (try? Data(contentsOf: watcherLogURL)),
+              let text = String(data: data, encoding: .utf8) else { return [] }
         let pattern = try? NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}),\\d+ (INFO|WARNING|ERROR) (.*)$")
         return text.split(separator: "\n").suffix(80).reversed().compactMap { raw in
             let line = String(raw)
@@ -915,6 +980,28 @@ private func runCommand(_ executable: String, _ arguments: [String]) -> CommandR
     } catch {
         return CommandResult(code: 127, output: error.localizedDescription)
     }
+}
+
+private func launchAgentRunningSync() -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = ["print", "gui/\(getuid())/com.local.codex-circuit-resumer"]
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    do {
+        try process.run()
+        process.waitUntilExit()
+        return process.terminationStatus == 0
+    } catch { return false }
+}
+
+private func readTailData(_ url: URL, maxBytes: Int) -> Data? {
+    guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+    defer { try? handle.close() }
+    let size = (try? handle.seekToEnd()) ?? 0
+    let offset = size > UInt64(maxBytes) ? size - UInt64(maxBytes) : 0
+    try? handle.seek(toOffset: offset)
+    return try? handle.readToEnd()
 }
 
 @main
@@ -1556,7 +1643,7 @@ private struct SettingsView: View {
                     NumberSettingRow(title: "无响应保护", detail: "任务没有明确报错时，至少沉默多久才视为中断。", value: $model.idleSeconds, range: 60...900, suffix: "秒")
                         .onChange(of: model.idleSeconds) { _ in model.markSettingsDirty() }
                     Divider()
-                    NumberSettingRow(title: "单次任务上限", detail: "一次熔断最多恢复多少条对话。", value: $model.maxCandidates, range: 1...16, suffix: "条")
+                    NumberSettingRow(title: "单批任务上限", detail: "候选较多时自动分批，超过上限的任务会安全排队，不会丢失。", value: $model.maxCandidates, range: 1...16, suffix: "条")
                         .onChange(of: model.maxCandidates) { _ in model.markSettingsDirty() }
                 }
                 SettingsSection(title: "无人值守") {
