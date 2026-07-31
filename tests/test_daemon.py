@@ -946,12 +946,16 @@ class ReliabilityTests(unittest.TestCase):
 
     def test_status_reports_fresh_heartbeat_and_counts(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            fake_codex = Path(tmp) / "codex"
+            fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_codex.chmod(0o755)
             state = daemon.initial_state()
             state["heartbeat_at"] = int(time.time())
             state["inflight"] = {self.thread_id: {"thread_id": self.thread_id}}
             state["blocked"] = {"other": {"turn_id": "turn-blocked"}}
             daemon.save_state(state)
             config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_binary": str(fake_codex), "prefer_native_codex": False})
             payload = daemon.status_payload(config)
             self.assertTrue(payload["healthy"])
             self.assertEqual(payload["inflight_count"], 1)
