@@ -12,7 +12,9 @@ Get-CimInstance Win32_Process -Filter "Name='CodexCircuitResumer.exe'" -ErrorAct
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Copy-Item (Join-Path $Source '*') $InstallDir -Recurse -Force
 $Shell = New-Object -ComObject WScript.Shell
-$Shortcut = $Shell.CreateShortcut((Join-Path ([Environment]::GetFolderPath('Desktop')) 'Codex 熔断续聊.lnk'))
+$Desktop = [Environment]::GetFolderPath('Desktop')
+New-Item -ItemType Directory -Force -Path $Desktop | Out-Null
+$Shortcut = $Shell.CreateShortcut((Join-Path $Desktop 'Codex 熔断续聊.lnk'))
 $Shortcut.TargetPath = Join-Path $InstallDir 'CodexCircuitResumer.exe'
 $Shortcut.WorkingDirectory = $InstallDir
 $Shortcut.Description = 'Codex 熔断续聊'

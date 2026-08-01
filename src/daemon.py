@@ -3269,7 +3269,17 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def configure_standard_streams():
+    if not IS_WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv=None):
+    configure_standard_streams()
     args = parse_args(argv)
     setup_logging()
     config = load_config()
