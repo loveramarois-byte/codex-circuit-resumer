@@ -927,6 +927,160 @@ class ModelRetryTests(unittest.TestCase):
             finally:
                 daemon.APP_HOME, daemon.STATE_PATH, daemon.PAUSE_PATH = old_paths
 
+    def test_due_retry_uses_free_parallel_slot(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-parallel", started_at=now - 5),
+                    event(
+                        "task_complete",
+                        turn_id="turn-parallel",
+                        completed_at=now - 1,
+                        last_agent_message=None,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                ],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"max_parallel_resumes": 2, "codex_sessions_dir": str(root)})
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["inflight"] = {
+                "other-thread": {"thread_id": "other-thread", "status": "running"}
+            }
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": thread_id,
+                    "turn_id": "turn-parallel",
+                    "title": "等待中的独立任务",
+                    "cwd": str(root),
+                    "rollout_path": str(rollout),
+                    "not_before": now - 1,
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual([item["thread_id"] for item in watcher.state["queue"]], [thread_id])
+            self.assertEqual(watcher.state["scheduled_retries"], [])
+            self.assertEqual(watcher.state["phase"], "resuming")
+
+    def test_stalled_active_turn_uses_free_parallel_slot_when_idle(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [event("task_started", turn_id="turn-stalled", started_at=now - 1000)],
+            )
+            os.utime(rollout, (now - 1000, now - 1000))
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update(
+                {
+                    "max_parallel_resumes": 2,
+                    "active_thread_idle_seconds": 240,
+                    "codex_sessions_dir": str(root),
+                }
+            )
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["inflight"] = {
+                "other-thread": {"thread_id": "other-thread", "status": "running"}
+            }
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": thread_id,
+                    "turn_id": "turn-stalled",
+                    "title": "等待中的僵住任务",
+                    "cwd": str(root),
+                    "rollout_path": str(rollout),
+                    "not_before": now - 1,
+                    "source": "stalled_turn",
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual([item["thread_id"] for item in watcher.state["queue"]], [thread_id])
+            self.assertEqual(watcher.state["scheduled_retries"], [])
+
+    def test_recent_active_stalled_turn_is_delayed(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [event("task_started", turn_id="turn-fresh", started_at=now - 5)],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update(
+                {
+                    "max_parallel_resumes": 2,
+                    "active_thread_idle_seconds": 240,
+                    "codex_sessions_dir": str(root),
+                }
+            )
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": thread_id,
+                    "turn_id": "turn-fresh",
+                    "title": "仍在输出的任务",
+                    "cwd": str(root),
+                    "rollout_path": str(rollout),
+                    "not_before": now - 1,
+                    "source": "stalled_turn",
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual(watcher.state["queue"], [])
+            self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
+            self.assertGreater(watcher.state["scheduled_retries"][0]["not_before"], now)
+
+    def test_retry_discovery_continues_while_another_resume_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-discover", started_at=now - 5),
+                    event(
+                        "task_complete",
+                        turn_id="turn-discover",
+                        completed_at=now - 1,
+                        last_agent_message=None,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                ],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_sessions_dir": str(root), "codex_state_db": str(root / "missing.db")})
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["inflight"] = {"other-thread": {"thread_id": "other-thread"}}
+            watcher.state["last_error_scan_at"] = 0
+            watcher.state["retry_scan_cursor"] = now - 10
+
+            watcher.discover_retryable_failures(now)
+
+            self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
+            self.assertEqual(watcher.state["scheduled_retries"][0]["thread_id"], thread_id)
+
     def test_retry_watch_window_ignores_old_capacity_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

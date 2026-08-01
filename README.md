@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)](#环境要求)
 [![Windows 10/11](https://img.shields.io/badge/Windows-10%2F11-blue?logo=windows)](#环境要求)
-[![Release](https://img.shields.io/badge/release-2.7.0-blue)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-2.7.1-blue)](CHANGELOG.md)
 
 一个面向 macOS、Windows、CC Switch 与 Codex Desktop 的本地守望工具。它监控中转线路熔断、模型池满载和临时网关故障，在条件恢复后继续原 Codex 对话，并提供渠道健康、真实倍率、人民币费用及 Claude Desktop 渠道状态总览。
 

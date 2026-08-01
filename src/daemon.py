@@ -74,7 +74,7 @@ DEFAULT_CONFIG = {
     "poll_seconds": 2,
     "candidate_window_padding_seconds": 8,
     "max_candidates_per_incident": 8,
-    "max_parallel_resumes": 1,
+    "max_parallel_resumes": 2,
     "resume_prompt": "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。",
     "notify": True,
     "model_retry_enabled": True,
@@ -899,7 +899,7 @@ def update_thread_reasoning_effort(config, thread_id, effort):
             1,
             "initialize",
             {
-                "clientInfo": {"name": "codex-circuit-resumer", "version": "2.7.0"},
+                "clientInfo": {"name": "codex-circuit-resumer", "version": "2.7.1"},
                 "capabilities": {"experimentalApi": True},
             },
         )
@@ -2754,8 +2754,10 @@ class Watcher:
     def discover_retryable_failures(self, now):
         if not self.config.get("model_retry_enabled", True):
             return
-        # Avoid competing with circuit recovery flow.
-        if self.state.get("phase") in {"circuit_open", "recovery_grace", "resuming"}:
+        # Avoid competing with the circuit recovery flow. Retry discovery can
+        # continue while another task is being resumed; launch_next enforces
+        # the configured concurrency limit.
+        if self.state.get("phase") in {"circuit_open", "recovery_grace"}:
             return
         scan_interval = max(2, int(self.config.get("retry_error_scan_seconds", 10)))
         last_error_scan = int(self.state.get("last_error_scan_at") or 0)
@@ -2837,9 +2839,11 @@ class Watcher:
 
     def promote_due_retries(self, now):
         # Don't compete with circuit-breaker recovery flow.
-        if self.state.get("phase") in {"circuit_open", "recovery_grace", "resuming"}:
+        if self.state.get("phase") in {"circuit_open", "recovery_grace"}:
             return
-        if self.processes or self.state.get("inflight"):
+        inflight = self.state.setdefault("inflight", {})
+        max_parallel = max(1, int(self.config.get("max_parallel_resumes", 1)))
+        if len(inflight) >= max_parallel:
             return
         scheduled = self.state.get("scheduled_retries") or []
         due = [item for item in scheduled if int(item.get("not_before") or 0) <= now]
@@ -2870,13 +2874,27 @@ class Watcher:
             save_state(self.state)
             return
         if current.get("state") == "active":
-            # User or another resume is already running; re-check later.
-            item["not_before"] = now + int(self.config.get("model_retry_base_seconds", 60))
-            scheduled.append(item)
-            self.set_event("任务仍在执行，延后重试：{}".format(item.get("title")), now)
+            stale_active = False
+            if item.get("source") == "stalled_turn":
+                idle_seconds = int(self.config.get("active_thread_idle_seconds", 240))
+                try:
+                    modified_at = int(rollout.stat().st_mtime)
+                except OSError:
+                    modified_at = now
+                stale_active = modified_at <= now - idle_seconds
+            if not stale_active:
+                # User or another resume is already running; re-check later.
+                item["not_before"] = now + int(self.config.get("model_retry_base_seconds", 60))
+                scheduled.append(item)
+                self.set_event("任务仍在执行，延后重试：{}".format(item.get("title")), now)
+                save_state(self.state)
+                return
+
+        queue = self.state.setdefault("queue", [])
+        if any(existing.get("thread_id") == item.get("thread_id") for existing in queue):
             save_state(self.state)
             return
-        self.state["queue"] = [item]
+        queue.append(item)
         self.state["phase"] = "resuming"
         self.set_event("无人值守重试到点：{}".format(item.get("title")), now)
         save_state(self.state)

@@ -10,7 +10,7 @@
     "/usr/local/bin"
   ],
   "max_candidates_per_incident": 8,
-  "max_parallel_resumes": 1,
+  "max_parallel_resumes": 2,
   "resume_prompt": "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。",
   "notify": true,
   "model_retry_enabled": true,

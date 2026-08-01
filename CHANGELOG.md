@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use semantic versioning where practical.
 
+## [2.7.1] - 2026-08-02
+
+### Fixed
+
+- Allow due retries to use a free resume slot while another task is already being resumed.
+- Continue scanning Codex rollout errors during unrelated resume work, so simultaneous capacity/503 failures are not missed.
+- Resume genuinely stalled active turns instead of delaying them forever; active turns that are still writing logs remain protected.
+
+### Changed
+
+- Raise the default unattended resume concurrency from 1 to 2 for low-rate CC Switch failover setups.
+
+### Verified
+
+- 78 unit tests.
+- 50 process-level macOS drills.
+
 ## [2.7.0] - 2026-08-02
 
 ### Added
