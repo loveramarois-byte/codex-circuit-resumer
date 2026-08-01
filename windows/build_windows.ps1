@@ -6,8 +6,11 @@ $Stage = Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64'
 Remove-Item $OutputDir -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 python -m pip install --disable-pip-version-check --quiet pyinstaller==6.15.0
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m PyInstaller --noconfirm --clean --onefile --name CodexCircuitResumerDaemon (Join-Path $Project 'src\daemon.py') --distpath $Stage --workpath (Join-Path $BuildTemp 'ccr-daemon-work') --specpath (Join-Path $BuildTemp 'ccr-spec')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name CodexCircuitResumer (Join-Path $Project 'windows\gui.py') --distpath $Stage --workpath (Join-Path $BuildTemp 'ccr-gui-work') --specpath (Join-Path $BuildTemp 'ccr-spec')
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Copy-Item (Join-Path $Project 'windows\control.ps1'), (Join-Path $Project 'windows\Install.ps1'), (Join-Path $Project 'windows\Install.cmd'), (Join-Path $Project 'windows\Uninstall.ps1'), (Join-Path $Project 'config.example.json') $Stage
 Get-ChildItem $Stage -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content (Join-Path $Stage 'SHA256SUMS.txt') -Encoding ascii
 Compress-Archive -Path $Stage -DestinationPath (Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64.zip') -CompressionLevel Optimal

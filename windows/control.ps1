@@ -69,6 +69,8 @@ switch ($Action) {
     'stop' { Stop-Watcher; Write-Output '已停止。' }
     'status' {
         if (-not (Test-Path $Daemon)) { throw "找不到后台程序：$Daemon" }
-        & $Daemon --status
+        $Output = & $Daemon --status
+        if ($LASTEXITCODE -ne 0) { throw "后台状态读取失败，退出码：$LASTEXITCODE" }
+        $Output
     }
 }
