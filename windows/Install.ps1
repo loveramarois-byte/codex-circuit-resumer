@@ -1,4 +1,4 @@
-param([switch]$NoLaunch)
+﻿param([switch]$NoLaunch)
 $ErrorActionPreference = 'Stop'
 $Source = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AppHome = Join-Path $env:LOCALAPPDATA 'CodexCircuitResumer'

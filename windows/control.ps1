@@ -1,4 +1,4 @@
-param([ValidateSet('install','uninstall','start','stop','status')][string]$Action = 'status')
+﻿param([ValidateSet('install','uninstall','start','stop','status')][string]$Action = 'status')
 $ErrorActionPreference = 'Stop'
 $AppHome = Join-Path $env:LOCALAPPDATA 'CodexCircuitResumer'
 $InstallDir = Join-Path $AppHome 'app'
@@ -9,6 +9,9 @@ $RunName = 'CodexCircuitResumer'
 $PidFile = Join-Path $AppHome 'daemon.pid'
 
 function Stop-Watcher {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if (-not $PSCmdlet.ShouldProcess('CodexCircuitResumer', 'Stop watcher')) { return }
     if (Test-Path $PidFile) {
         $WatcherPid = [int](Get-Content $PidFile -Raw)
         Stop-Process -Id $WatcherPid -Force -ErrorAction SilentlyContinue
@@ -20,6 +23,9 @@ function Stop-Watcher {
 }
 
 function Start-Watcher {
+    [CmdletBinding(SupportsShouldProcess)]
+    param()
+    if (-not $PSCmdlet.ShouldProcess('CodexCircuitResumer', 'Start watcher')) { return }
     if (-not (Test-Path $Daemon)) { throw "找不到后台程序：$Daemon" }
     if (Test-Path $PidFile) {
         $ExistingPid = [int](Get-Content $PidFile -Raw)

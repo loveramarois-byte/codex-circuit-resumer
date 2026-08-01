@@ -34,6 +34,7 @@ jobs:
         shell: pwsh
         run: |
           python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
           $results = Invoke-ScriptAnalyzer -Path windows -Recurse -Severity Error,Warning
           if ($results) { $results | Format-Table -AutoSize; throw 'PowerShell analysis failed.' }

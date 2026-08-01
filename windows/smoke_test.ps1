@@ -1,4 +1,4 @@
-param([Parameter(Mandatory=$true)][string]$Stage)
+﻿param([Parameter(Mandatory=$true)][string]$Stage)
 $ErrorActionPreference = 'Stop'
 $Runtime = Join-Path $env:RUNNER_TEMP 'CodexCircuitResumerSmoke'
 Remove-Item $Runtime -Recurse -Force -ErrorAction SilentlyContinue

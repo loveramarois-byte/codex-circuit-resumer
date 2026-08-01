@@ -180,7 +180,7 @@ class DetectionTests(unittest.TestCase):
             os.utime(str(rollout), (now, now))
 
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     "CREATE TABLE proxy_request_logs (app_type TEXT, created_at INTEGER, status_code INTEGER, session_id TEXT)"
                 )
@@ -190,7 +190,7 @@ class DetectionTests(unittest.TestCase):
                 )
 
             state_db = root / "state.db"
-            with sqlite3.connect(str(state_db)) as db:
+            with daemon.sqlite_connection(str(state_db)) as db:
                 db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
                 db.execute(
                     "INSERT INTO threads VALUES (?, ?, ?, ?)",
@@ -242,7 +242,7 @@ class DetectionTests(unittest.TestCase):
                 os.utime(str(rollout), (recovered_at, recovered_at))
 
                 cc_db = root / "cc.db"
-                with sqlite3.connect(str(cc_db)) as db:
+                with daemon.sqlite_connection(str(cc_db)) as db:
                     db.execute(
                         "CREATE TABLE proxy_request_logs (app_type TEXT, created_at INTEGER, status_code INTEGER, session_id TEXT)"
                     )
@@ -252,7 +252,7 @@ class DetectionTests(unittest.TestCase):
                     )
 
                 state_db = root / "state.db"
-                with sqlite3.connect(str(state_db)) as db:
+                with daemon.sqlite_connection(str(state_db)) as db:
                     db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
                     db.execute(
                         "INSERT INTO threads VALUES (?, ?, ?, ?)",
@@ -307,7 +307,7 @@ class DetectionTests(unittest.TestCase):
             os.utime(str(rollout), (now, now))
 
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     "CREATE TABLE proxy_request_logs (app_type TEXT, created_at INTEGER, status_code INTEGER, session_id TEXT)"
                 )
@@ -316,7 +316,7 @@ class DetectionTests(unittest.TestCase):
                     (now, thread_id),
                 )
             state_db = root / "state.db"
-            with sqlite3.connect(str(state_db)) as db:
+            with daemon.sqlite_connection(str(state_db)) as db:
                 db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
                 db.execute("INSERT INTO threads VALUES (?, ?, ?, ?)", (thread_id, str(rollout), str(root), "卡住任务"))
 
@@ -348,7 +348,7 @@ class DetectionTests(unittest.TestCase):
             now = int(time.time())
             cc_db = root / "cc.db"
             state_db = root / "state.db"
-            with sqlite3.connect(str(cc_db)) as log_db, sqlite3.connect(str(state_db)) as state_db_connection:
+            with daemon.sqlite_connection(str(cc_db)) as log_db, daemon.sqlite_connection(str(state_db)) as state_db_connection:
                 log_db.execute("CREATE TABLE proxy_request_logs (app_type TEXT, created_at INTEGER, status_code INTEGER, session_id TEXT)")
                 state_db_connection.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
                 for index in range(3):
@@ -394,8 +394,9 @@ class DetectionTests(unittest.TestCase):
     def test_runtime_path_contains_user_node_locations(self):
         config = dict(daemon.DEFAULT_CONFIG)
         joined = os.pathsep.join(config["extra_path"])
-        self.assertIn(".local/bin", joined)
-        self.assertIn(".hermes/node/bin", joined)
+        normalized = joined.replace("\\", "/")
+        self.assertIn(".local/bin", normalized)
+        self.assertIn(".hermes/node/bin", normalized)
 
 
 class CodexStateDatabaseTests(unittest.TestCase):
@@ -449,7 +450,7 @@ class CodexStateDatabaseTests(unittest.TestCase):
 class ModelRetryTests(unittest.TestCase):
     def _reasoning_state_db(self, root, thread_id, rollout, effort="medium"):
         path = Path(root) / "state.db"
-        with sqlite3.connect(str(path)) as db:
+        with daemon.sqlite_connection(str(path)) as db:
             db.execute(
                 "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT, reasoning_effort TEXT)"
             )
@@ -579,8 +580,14 @@ class ModelRetryTests(unittest.TestCase):
                 ],
             )
             state_db = self._reasoning_state_db(root, thread_id, rollout, effort="medium")
+            codex_config = root / "config.toml"
+            codex_config.write_text('model_reasoning_effort = "high"\n', encoding="utf-8")
             config = dict(daemon.DEFAULT_CONFIG)
-            config.update({"codex_state_db": str(state_db), "capacity_reasoning_promote_after_seconds": 60})
+            config.update({
+                "codex_state_db": str(state_db),
+                "codex_config": str(codex_config),
+                "capacity_reasoning_promote_after_seconds": 60,
+            })
             watcher = daemon.Watcher(config)
             record = daemon.thread_paths_from_db(config, {thread_id})[thread_id]
             self.assertTrue(watcher.discover_reasoning_restore_candidate(thread_id, record, 130))
@@ -800,7 +807,7 @@ class ModelRetryTests(unittest.TestCase):
                 )
                 os.utime(str(rollout), (now, now))
                 state_db = root / "state.db"
-                with sqlite3.connect(str(state_db)) as db:
+                with daemon.sqlite_connection(str(state_db)) as db:
                     db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
                     db.execute(
                         "INSERT INTO threads VALUES (?, ?, ?, ?)",
@@ -947,7 +954,7 @@ class ModelRetryTests(unittest.TestCase):
                 )
                 os.utime(str(rollout), (old, old))
                 state_db = root / "state.db"
-                with sqlite3.connect(str(state_db)) as db:
+                with daemon.sqlite_connection(str(state_db)) as db:
                     db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
                     db.execute("INSERT INTO threads VALUES (?, ?, ?, ?)", (thread_id, str(rollout), str(root), "旧满载"))
                 config = dict(daemon.DEFAULT_CONFIG)
@@ -1141,7 +1148,7 @@ class ReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             root = Path(tmp)
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     "CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, "
                     "in_failover_queue INTEGER, sort_index INTEGER)"
@@ -1156,14 +1163,14 @@ class ReliabilityTests(unittest.TestCase):
                 config, state, int(time.time()), "OpenResty HTML 400"
             )
             self.assertEqual(bypass["provider_id"], "p1")
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 rows = db.execute(
                     "SELECT id,in_failover_queue,sort_index FROM providers ORDER BY sort_index"
                 ).fetchall()
             self.assertEqual(rows, [("p1", 0, 1), ("p2", 1, 2)])
 
             self.assertTrue(daemon.restore_temporary_failover_bypasses(config, state))
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 rows = db.execute(
                     "SELECT id,in_failover_queue,sort_index FROM providers ORDER BY sort_index"
                 ).fetchall()
@@ -1174,7 +1181,7 @@ class ReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             root = Path(tmp)
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     "CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, "
                     "in_failover_queue INTEGER, sort_index INTEGER)"
@@ -1187,7 +1194,7 @@ class ReliabilityTests(unittest.TestCase):
             daemon.temporarily_bypass_first_codex_provider(config, state, int(time.time()), "test")
 
             daemon.Watcher(config)
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 flags = db.execute(
                     "SELECT in_failover_queue FROM providers ORDER BY sort_index"
                 ).fetchall()
@@ -1199,7 +1206,7 @@ class ReliabilityTests(unittest.TestCase):
             root = Path(tmp)
             rollout = self.make_interrupted_rollout(root, turn_id="turn-gateway-launch")
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     "CREATE TABLE providers (id TEXT, app_type TEXT, name TEXT, "
                     "in_failover_queue INTEGER, sort_index INTEGER)"
@@ -1215,7 +1222,7 @@ class ReliabilityTests(unittest.TestCase):
             watcher.state["queue"] = [item]
             with mock.patch.object(daemon.subprocess, "Popen", side_effect=OSError("temporary spawn failure")):
                 watcher.launch_next(int(time.time()))
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 self.assertEqual(db.execute("SELECT in_failover_queue FROM providers WHERE id='p1'").fetchone()[0], 1)
             self.assertEqual(watcher.state["queue"], [])
             self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
@@ -1295,7 +1302,7 @@ class ReliabilityTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute("CREATE TABLE proxy_request_logs (app_type TEXT, status_code INTEGER, created_at INTEGER)")
                 db.execute("INSERT INTO proxy_request_logs VALUES ('codex', 200, ?)", (now - 2,))
             config = dict(daemon.DEFAULT_CONFIG)
@@ -1425,7 +1432,7 @@ class ReliabilityTests(unittest.TestCase):
 
 class ProxyRoutingTests(unittest.TestCase):
     def make_proxy_db(self, path):
-        with sqlite3.connect(str(path)) as db:
+        with daemon.sqlite_connection(str(path)) as db:
             db.execute(
                 """CREATE TABLE proxy_config (
                     app_type TEXT PRIMARY KEY,
@@ -1490,7 +1497,8 @@ experimental_bearer_token = \"secret-current\"
                 "http://127.0.0.1:15721/v1",
             )
             self.assertEqual(backup_path.read_text(encoding="utf-8"), original)
-            self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(backup_path.stat().st_mode & 0o777, 0o600)
 
     def test_launch_waits_instead_of_hitting_direct_route_when_proxy_is_down(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
@@ -1564,7 +1572,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "legacy.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute("CREATE TABLE providers (id TEXT, name TEXT, app_type TEXT)")
                 db.execute(
                     "CREATE TABLE proxy_request_logs (provider_id TEXT, app_type TEXT, status_code INTEGER, "
@@ -1627,7 +1635,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "ordered.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute("CREATE TABLE providers (id TEXT,name TEXT,settings_config TEXT,website_url TEXT,is_current INTEGER,in_failover_queue INTEGER,sort_index INTEGER,cost_multiplier TEXT,provider_type TEXT,app_type TEXT)")
                 db.execute("CREATE TABLE provider_health (provider_id TEXT,app_type TEXT,is_healthy INTEGER,consecutive_failures INTEGER,last_success_at INTEGER,last_failure_at INTEGER,last_error TEXT)")
                 db.execute("CREATE TABLE proxy_request_logs (provider_id TEXT,app_type TEXT,status_code INTEGER,latency_ms INTEGER,created_at INTEGER,error_message TEXT,model TEXT,request_model TEXT,total_cost_usd TEXT,cost_multiplier TEXT)")
@@ -1665,7 +1673,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "apps.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute("CREATE TABLE providers (id TEXT,name TEXT,settings_config TEXT,website_url TEXT,is_current INTEGER,in_failover_queue INTEGER,sort_index INTEGER,cost_multiplier TEXT,provider_type TEXT,app_type TEXT)")
                 db.execute("CREATE TABLE provider_health (provider_id TEXT,app_type TEXT,is_healthy INTEGER,consecutive_failures INTEGER,last_success_at INTEGER,last_failure_at INTEGER,last_error TEXT)")
                 db.execute("CREATE TABLE proxy_request_logs (provider_id TEXT,app_type TEXT,status_code INTEGER,latency_ms INTEGER,created_at INTEGER,error_message TEXT,model TEXT,request_model TEXT,total_cost_usd TEXT,cost_multiplier TEXT)")
@@ -1683,7 +1691,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "cost-reconciliation.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute("CREATE TABLE providers (id TEXT,name TEXT,settings_config TEXT,website_url TEXT,is_current INTEGER,in_failover_queue INTEGER,sort_index INTEGER,cost_multiplier TEXT,provider_type TEXT,app_type TEXT)")
                 db.execute("CREATE TABLE provider_health (provider_id TEXT,app_type TEXT,is_healthy INTEGER,consecutive_failures INTEGER,last_success_at INTEGER,last_failure_at INTEGER,last_error TEXT)")
                 db.execute("CREATE TABLE proxy_request_logs (provider_id TEXT,app_type TEXT,status_code INTEGER,latency_ms INTEGER,created_at INTEGER,error_message TEXT,model TEXT,request_model TEXT,total_cost_usd TEXT,cost_multiplier TEXT,data_source TEXT)")
@@ -1711,7 +1719,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     """
                     CREATE TABLE providers (
@@ -1779,7 +1787,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "degraded.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute("CREATE TABLE providers (id TEXT,name TEXT,settings_config TEXT,website_url TEXT,is_current INTEGER,in_failover_queue INTEGER,sort_index INTEGER,cost_multiplier TEXT,provider_type TEXT,app_type TEXT)")
                 db.execute("CREATE TABLE provider_health (provider_id TEXT,app_type TEXT,is_healthy INTEGER,consecutive_failures INTEGER,last_success_at INTEGER,last_failure_at INTEGER,last_error TEXT)")
                 db.execute("CREATE TABLE proxy_request_logs (provider_id TEXT,app_type TEXT,status_code INTEGER,latency_ms INTEGER,created_at INTEGER,error_message TEXT,model TEXT,request_model TEXT,total_cost_usd TEXT,cost_multiplier TEXT)")
@@ -1796,7 +1804,7 @@ class ProviderSnapshotTests(unittest.TestCase):
             root = Path(tmp)
             now = int(time.time())
             cc_db = root / "cc.db"
-            with sqlite3.connect(str(cc_db)) as db:
+            with daemon.sqlite_connection(str(cc_db)) as db:
                 db.execute(
                     """
                     CREATE TABLE providers (

@@ -40,7 +40,9 @@ jobs:
         shell: pwsh
         run: |
           python -m unittest discover -s tests -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m py_compile src/daemon.py tests/real_machine_drill.py windows/gui.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Analyze PowerShell
         shell: pwsh

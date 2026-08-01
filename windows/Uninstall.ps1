@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $AppHome = Join-Path $env:LOCALAPPDATA 'CodexCircuitResumer'
 $InstallDir = Join-Path $AppHome 'app'
 if (Test-Path (Join-Path $InstallDir 'control.ps1')) { & (Join-Path $InstallDir 'control.ps1') uninstall }

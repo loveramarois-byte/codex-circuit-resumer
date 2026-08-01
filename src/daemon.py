@@ -2,6 +2,7 @@
 """Resume interrupted Codex threads after CC Switch's circuit breaker recovers."""
 
 import argparse
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import glob
@@ -40,6 +41,16 @@ LOG_PATH = APP_HOME / "logs" / "watcher.log"
 RUN_LOG_DIR = APP_HOME / "logs" / "runs"
 PROVIDERS_PATH = APP_HOME / "providers.json"
 EXCHANGE_RATE_CACHE_PATH = APP_HOME / "exchange-rate.json"
+
+
+@contextmanager
+def sqlite_connection(*args, **kwargs):
+    connection = sqlite3.connect(*args, **kwargs)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 DEFAULT_CONFIG = {
     "config_schema_version": 8,
@@ -354,7 +365,7 @@ def temporarily_bypass_first_codex_provider(config, state, now=None, reason="HTM
     if not db_path or not os.path.exists(db_path):
         return None
     try:
-        with sqlite3.connect(str(db_path), timeout=3.0) as db:
+        with sqlite_connection(str(db_path), timeout=3.0) as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
             required = {"id", "app_type", "name", "in_failover_queue", "sort_index"}
             if not required.issubset(columns):
@@ -416,7 +427,7 @@ def restore_temporary_failover_bypasses(config, state, provider_id=None, now=Non
     if not db_path or not os.path.exists(db_path):
         return False
     try:
-        with sqlite3.connect(str(db_path), timeout=3.0) as db:
+        with sqlite_connection(str(db_path), timeout=3.0) as db:
             for item in targets:
                 if item.get("original_in_failover_queue"):
                     db.execute(
@@ -545,7 +556,7 @@ def cc_switch_codex_proxy_settings(db_path):
         return None
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=2.0) as db:
             row = db.execute(
                 """SELECT proxy_enabled,listen_address,listen_port,enabled,auto_failover_enabled
                    FROM proxy_config WHERE app_type='codex'"""
@@ -749,8 +760,6 @@ def event_epoch(event, fallback=0):
 def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400):
     """Find a recent capacity error followed by a lower Desktop thread setting."""
     default_target = normalize_reasoning_effort(target_effort)
-    if not default_target:
-        return None
     now = int(now if now is not None else time.time())
     selected_effort = None
     restore_target = None
@@ -767,6 +776,8 @@ def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400)
             error_text = json.dumps(error, ensure_ascii=False) if error else ""
             if is_model_capacity_error(error_text):
                 capacity_target = selected_effort or default_target
+                if not capacity_target:
+                    continue
                 if not restore_target or not reasoning_effort_is_lower(capacity_target, restore_target):
                     restore_target = capacity_target
                 last_capacity_at = event_epoch(event, now)
@@ -1491,7 +1502,7 @@ def build_provider_snapshot(
         }
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=3.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=3.0) as db:
             db.row_factory = sqlite3.Row
             log_columns = sqlite_columns(db, "proxy_request_logs")
             provider_columns = sqlite_columns(db, "providers")
@@ -1942,7 +1953,7 @@ def thread_paths_from_db(config, thread_ids):
         result = {}
         try:
             uri = db_path.resolve().as_uri() + "?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+            with sqlite_connection(uri, uri=True, timeout=2.0) as db:
                 columns = {row[1] for row in db.execute("PRAGMA table_info(threads)").fetchall()}
                 effort_column = ", reasoning_effort" if "reasoning_effort" in columns else ""
                 rows = db.execute(
@@ -1990,7 +2001,7 @@ def failed_thread_ids(config, opened_at, recovered_at):
         return result
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=2.0) as db:
             rows = db.execute(
                 """
                 SELECT DISTINCT session_id
@@ -2033,7 +2044,7 @@ def latest_success_after(config, started_at):
         return None
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=3.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=3.0) as db:
             row = db.execute(
                 """
                 SELECT MAX(created_at) FROM proxy_request_logs
@@ -2185,7 +2196,7 @@ class Watcher:
         target = configured_reasoning_effort(self.config)
         current = normalize_reasoning_effort((record or {}).get("reasoning_effort"))
         path_text = str((record or {}).get("path") or "")
-        if not target or not current or not path_text:
+        if not current or not path_text:
             return False
         pending = self.state.setdefault("reasoning_restore_pending", {})
         existing = pending.get(thread_id) or {}
