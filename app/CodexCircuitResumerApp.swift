@@ -351,6 +351,7 @@ private final class AppModel: ObservableObject {
     @Published var exchangeRateSource = "fallback"
     @Published var estimatedProviderCount = 0
     @Published var scheduledRetryCount = 0
+    @Published var reasoningRestorePendingCount = 0
     @Published var nextRetryAt = 0
     @Published var nextRetryTitle = ""
     @Published var nextRetryAttempt = 0
@@ -478,6 +479,7 @@ private final class AppModel: ObservableObject {
     var watcherDetail: String {
         if proxyRouteStatus == "unavailable" || proxyRouteStatus == "error" { return proxyRouteDetail }
         if scheduledRetryCount > 0 { return "下一次自动动作：\(nextRetrySummary)" }
+        if reasoningRestorePendingCount > 0 { return "有 \(reasoningRestorePendingCount) 条对话等待安全恢复原档位，执行中的请求不会被打断。" }
         if lastSuccessAt > 0 && !lastSuccessTitle.isEmpty { return "\(heartbeatDetail)；最近完成：\(lastSuccessTitle)" }
         return "\(heartbeatDetail)；关闭本窗口不影响运行。"
     }
@@ -586,6 +588,9 @@ private final class AppModel: ObservableObject {
         queueCount = activeQueueCount + backlogCount
         let scheduled = state["scheduled_retries"] as? [[String: Any]] ?? []
         scheduledRetryCount = state["scheduled_retry_count"] as? Int ?? scheduled.count
+        reasoningRestorePendingCount = state["reasoning_restore_pending_count"] as? Int
+            ?? (state["reasoning_restore_pending"] as? [String: Any])?.count
+            ?? 0
         if let next = scheduled.min(by: { ($0["not_before"] as? Int ?? Int.max) < ($1["not_before"] as? Int ?? Int.max) }) {
             nextRetryAt = next["not_before"] as? Int ?? 0
             nextRetryTitle = next["title"] as? String ?? "Codex 对话"
@@ -1237,7 +1242,7 @@ private struct MetricsView: View {
         HStack(spacing: 10) {
             MetricCell(label: "后台健康", value: model.healthTitle, color: model.healthColor, compact: true)
             MetricCell(label: "正在续接", value: "\(model.inflightCount)", color: model.inflightCount > 0 ? Palette.accent : Palette.ink)
-            MetricCell(label: "待处理队列", value: "\(model.queueCount + model.scheduledRetryCount)", color: model.queueCount + model.scheduledRetryCount > 0 ? Palette.warning : Palette.ink)
+            MetricCell(label: "待处理队列", value: "\(model.queueCount + model.scheduledRetryCount + model.reasoningRestorePendingCount)", color: model.queueCount + model.scheduledRetryCount + model.reasoningRestorePendingCount > 0 ? Palette.warning : Palette.ink)
             MetricCell(label: "需人工处理", value: "\(model.blockedCount)", color: model.blockedCount > 0 ? Palette.danger : Palette.ink)
         }
     }
@@ -1674,7 +1679,7 @@ private struct SettingsView: View {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("高档位恢复后自动升回").font(.system(size: 12, weight: .medium))
-                            Text("降档后每 15 分钟再试原来的高档位；高档位恢复就自动用回去，仍满则继续等待。")
+                            Text("降档后保留原始档位；对话空闲且冷却到期后，同步恢复 Codex Desktop 右下角档位。正在执行的请求不会被打断。")
                                 .font(.system(size: 10)).foregroundStyle(Palette.muted)
                         }
                         Spacer()

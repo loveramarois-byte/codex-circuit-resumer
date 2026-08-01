@@ -80,6 +80,9 @@ if old_version < 7:
     if configured_state_db in {legacy_state_db, "~/.codex/sqlite/state_5.sqlite"}:
         current["codex_state_db"] = "~/.codex/state_5.sqlite"
     current["config_schema_version"] = 7
+if old_version < 8:
+    current["capacity_reasoning_desktop_sync_enabled"] = bool(current.get("capacity_reasoning_desktop_sync_enabled", True))
+    current["config_schema_version"] = 8
 merged = dict(defaults)
 merged.update(current)
 config_path.parent.mkdir(parents=True, exist_ok=True)

@@ -2,6 +2,7 @@
 """Resume interrupted Codex threads after CC Switch's circuit breaker recovers."""
 
 import argparse
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import glob
@@ -11,12 +12,14 @@ from logging.handlers import RotatingFileHandler
 import os
 import random
 import re
+import select
 import signal
 import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,12 +27,13 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
-APP_HOME = Path(
-    os.environ.get(
-        "CODEX_CIRCUIT_RESUMER_HOME",
-        str(Path.home() / "Library" / "Application Support" / "CodexCircuitResumer"),
-    )
+IS_WINDOWS = os.name == "nt"
+DEFAULT_APP_HOME = (
+    Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "CodexCircuitResumer"
+    if IS_WINDOWS
+    else Path.home() / "Library" / "Application Support" / "CodexCircuitResumer"
 )
+APP_HOME = Path(os.environ.get("CODEX_CIRCUIT_RESUMER_HOME", str(DEFAULT_APP_HOME)))
 CONFIG_PATH = APP_HOME / "config.json"
 STATE_PATH = APP_HOME / "state.json"
 PAUSE_PATH = APP_HOME / "PAUSED"
@@ -38,19 +42,30 @@ RUN_LOG_DIR = APP_HOME / "logs" / "runs"
 PROVIDERS_PATH = APP_HOME / "providers.json"
 EXCHANGE_RATE_CACHE_PATH = APP_HOME / "exchange-rate.json"
 
+
+@contextmanager
+def sqlite_connection(*args, **kwargs):
+    connection = sqlite3.connect(*args, **kwargs)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
 DEFAULT_CONFIG = {
-    "config_schema_version": 7,
+    "config_schema_version": 8,
     "cc_switch_log": str(Path.home() / ".cc-switch" / "logs" / "cc-switch.log"),
     "cc_switch_db": str(Path.home() / ".cc-switch" / "cc-switch.db"),
     "codex_state_db": str(Path.home() / ".codex" / "state_5.sqlite"),
     "codex_sessions_dir": str(Path.home() / ".codex" / "sessions"),
     "codex_config": str(Path.home() / ".codex" / "config.toml"),
     "codex_proxy_backup": str(Path.home() / ".codex" / "config.toml.before-codex-resumer"),
-    "codex_binary": str(Path.home() / ".local" / "bin" / "codex"),
+    "codex_binary": str(Path.home() / ".local" / "bin" / ("codex.exe" if IS_WINDOWS else "codex")),
     "prefer_native_codex": True,
     "extra_path": [
         str(Path.home() / ".local" / "bin"),
         str(Path.home() / ".hermes" / "node" / "bin"),
+        str(Path.home() / "AppData" / "Roaming" / "npm"),
         "/opt/homebrew/bin",
         "/usr/local/bin",
     ],
@@ -75,6 +90,7 @@ DEFAULT_CONFIG = {
     "capacity_reasoning_minimum": "low",
     "capacity_reasoning_promote_enabled": True,
     "capacity_reasoning_promote_after_seconds": 900,
+    "capacity_reasoning_desktop_sync_enabled": True,
     "retry_error_scan_seconds": 10,
     "resume_exit_grace_seconds": 10,
     "launcher_unknown_failure_limit": 3,
@@ -209,6 +225,8 @@ def initial_state():
         "reasoning_efforts": {},
         "reasoning_originals": {},
         "reasoning_last_capacity_at": {},
+        "reasoning_restore_pending": {},
+        "reasoning_restore_last_scan": {},
         "retry_scan_cursor": None,
         "watch_started_at": int(time.time()),
         "last_retry_scan_at": 0,
@@ -264,7 +282,7 @@ def load_state():
     if state is not None:
         base.update(state)
     base["version"] = 2
-    for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures"):
+    for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "reasoning_restore_pending", "reasoning_restore_last_scan", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures"):
         if not isinstance(base.get(key), dict):
             base[key] = {}
     for key in ("queue", "candidate_backlog", "scheduled_retries", "temporary_failover_bypasses"):
@@ -347,7 +365,7 @@ def temporarily_bypass_first_codex_provider(config, state, now=None, reason="HTM
     if not db_path or not os.path.exists(db_path):
         return None
     try:
-        with sqlite3.connect(str(db_path), timeout=3.0) as db:
+        with sqlite_connection(str(db_path), timeout=3.0) as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(providers)").fetchall()}
             required = {"id", "app_type", "name", "in_failover_queue", "sort_index"}
             if not required.issubset(columns):
@@ -409,7 +427,7 @@ def restore_temporary_failover_bypasses(config, state, provider_id=None, now=Non
     if not db_path or not os.path.exists(db_path):
         return False
     try:
-        with sqlite3.connect(str(db_path), timeout=3.0) as db:
+        with sqlite_connection(str(db_path), timeout=3.0) as db:
             for item in targets:
                 if item.get("original_in_failover_queue"):
                     db.execute(
@@ -538,7 +556,7 @@ def cc_switch_codex_proxy_settings(db_path):
         return None
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=2.0) as db:
             row = db.execute(
                 """SELECT proxy_enabled,listen_address,listen_port,enabled,auto_failover_enabled
                    FROM proxy_config WHERE app_type='codex'"""
@@ -716,6 +734,206 @@ def configured_reasoning_effort(config):
     return None
 
 
+def reasoning_effort_is_lower(current, target):
+    current = normalize_reasoning_effort(current)
+    target = normalize_reasoning_effort(target)
+    if not current or not target:
+        return False
+    return REASONING_EFFORT_ORDER.index(current) < REASONING_EFFORT_ORDER.index(target)
+
+
+def event_epoch(event, fallback=0):
+    payload = event.get("payload") or {}
+    for key in ("completed_at", "started_at"):
+        value = as_epoch(payload.get(key), None)
+        if value is not None:
+            return value
+    timestamp = event.get("timestamp")
+    if timestamp:
+        try:
+            return int(dt.datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")).timestamp())
+        except (TypeError, ValueError):
+            pass
+    return int(fallback or 0)
+
+
+def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400):
+    """Find a recent capacity error followed by a lower Desktop thread setting."""
+    default_target = normalize_reasoning_effort(target_effort)
+    now = int(now if now is not None else time.time())
+    selected_effort = None
+    restore_target = None
+    last_capacity_at = 0
+    fallback_effort = None
+    fallback_at = 0
+    for event in iter_tail_json_objects(Path(path)):
+        if event.get("type") != "event_msg":
+            continue
+        payload = event.get("payload") or {}
+        payload_type = payload.get("type")
+        if payload_type == "task_complete":
+            error = payload.get("error")
+            error_text = json.dumps(error, ensure_ascii=False) if error else ""
+            if is_model_capacity_error(error_text):
+                capacity_target = selected_effort or default_target
+                if not capacity_target:
+                    continue
+                if not restore_target or not reasoning_effort_is_lower(capacity_target, restore_target):
+                    restore_target = capacity_target
+                last_capacity_at = event_epoch(event, now)
+                fallback_effort = None
+                fallback_at = 0
+        elif payload_type == "thread_settings_applied":
+            effort = normalize_reasoning_effort(
+                (payload.get("thread_settings") or {}).get("reasoning_effort")
+            )
+            if not effort:
+                continue
+            selected_effort = effort
+            applied_at = event_epoch(event, last_capacity_at or now)
+            # The database value checked by the caller is authoritative. A
+            # target-tier event can be written while an older lower-tier turn
+            # is still active; that turn may write its lower setting back to
+            # the database without another rollout settings event. Keep the
+            # fallback hint until the database itself reaches the target.
+            if last_capacity_at and applied_at >= last_capacity_at and reasoning_effort_is_lower(
+                effort, restore_target or default_target
+            ):
+                fallback_effort = effort
+                fallback_at = applied_at
+    if not last_capacity_at or not fallback_effort or not restore_target:
+        return None
+    if now - last_capacity_at > max(60, int(max_age_seconds)):
+        return None
+    return {
+        "target_effort": restore_target,
+        "fallback_effort": fallback_effort,
+        "last_capacity_at": last_capacity_at,
+        "fallback_at": fallback_at or last_capacity_at,
+    }
+
+
+def _app_server_rpc(process, request_id, method, params, timeout=15):
+    message = {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    }
+    process.stdin.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+    process.stdin.flush()
+    deadline = time.monotonic() + max(1, timeout)
+    if IS_WINDOWS:
+        result = {"response": None}
+
+        def read_response():
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    return
+                try:
+                    response = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if response.get("id") == request_id:
+                    result["response"] = response
+                    return
+
+        reader = threading.Thread(target=read_response, daemon=True)
+        reader.start()
+        reader.join(max(1, timeout))
+        response = result["response"]
+        if response is None:
+            raise TimeoutError("Codex app-server did not answer {}".format(method))
+        error = response.get("error")
+        if error:
+            raise RuntimeError(str((error or {}).get("message") or error))
+        return response.get("result") or {}
+    else:
+        lines = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        if lines is None:
+            ready, _, _ = select.select([process.stdout], [], [], min(0.5, max(0, deadline - time.monotonic())))
+            if not ready:
+                continue
+            line = process.stdout.readline()
+        else:
+            line = lines.pop(0) if lines else ""
+        if not line:
+            break
+        try:
+            response = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if response.get("id") != request_id:
+            continue
+        error = response.get("error")
+        if error:
+            raise RuntimeError(str((error or {}).get("message") or error))
+        return response.get("result") or {}
+    raise TimeoutError("Codex app-server did not answer {}".format(method))
+
+
+def update_thread_reasoning_effort(config, thread_id, effort):
+    """Persist an idle Codex Desktop thread effort through its official app-server API."""
+    effort = normalize_reasoning_effort(effort)
+    if not valid_thread_id(thread_id) or not effort:
+        return {"ok": False, "detail": "线程或档位无效"}
+    binary = resolve_codex_binary(config)
+    if not binary or not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        return {"ok": False, "detail": "找不到支持对话设置同步的 Codex CLI"}
+    process = None
+    try:
+        process = subprocess.Popen(
+            codex_command(binary, "app-server", "--stdio"),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        _app_server_rpc(
+            process,
+            1,
+            "initialize",
+            {
+                "clientInfo": {"name": "codex-circuit-resumer", "version": "2.7.0"},
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        _app_server_rpc(
+            process,
+            2,
+            "thread/resume",
+            {"threadId": thread_id, "excludeTurns": True},
+        )
+        _app_server_rpc(
+            process,
+            3,
+            "thread/settings/update",
+            {"threadId": thread_id, "effort": effort},
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError, TimeoutError) as exc:
+        return {"ok": False, "detail": redact_sensitive_text(exc)[:180]}
+    finally:
+        if process is not None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except (OSError, subprocess.SubprocessError):
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+    record = thread_paths_from_db(config, {thread_id}).get(thread_id, {})
+    actual = normalize_reasoning_effort(record.get("reasoning_effort"))
+    if actual != effort:
+        return {"ok": False, "detail": "Codex 未确认保存目标档位"}
+    return {"ok": True, "detail": "已通过 Codex 对话设置接口同步"}
+
+
 def redact_sensitive_text(text):
     value = str(text or "")
     patterns = (
@@ -740,8 +958,12 @@ def process_matches_resume(pid, thread_id):
     if not process_alive(pid):
         return False
     try:
+        command = (
+            ["powershell.exe", "-NoProfile", "-Command", "(Get-CimInstance Win32_Process -Filter \"ProcessId={}\").CommandLine".format(int(pid))]
+            if IS_WINDOWS else ["/bin/ps", "-p", str(int(pid)), "-o", "command="]
+        )
         result = subprocess.run(
-            ["/bin/ps", "-p", str(int(pid)), "-o", "command="],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -756,8 +978,12 @@ def process_matches_resume(pid, thread_id):
 
 def find_resume_pid(thread_id):
     try:
+        command = (
+            ["powershell.exe", "-NoProfile", "-Command", "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }"]
+            if IS_WINDOWS else ["/bin/ps", "-axo", "pid=,command="]
+        )
         result = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,command="],
+            command,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
@@ -776,12 +1002,12 @@ def find_resume_pid(thread_id):
 
 
 def resolve_codex_binary(config):
-    native_candidates = [
+    native_candidates = ([] if IS_WINDOWS else [
         "/Applications/ChatGPT.app/Contents/Resources/codex",
         "/Applications/Codex.app/Contents/Resources/codex",
         str(Path.home() / "Applications" / "ChatGPT.app" / "Contents" / "Resources" / "codex"),
         str(Path.home() / "Applications" / "Codex.app" / "Contents" / "Resources" / "codex"),
-    ]
+    ])
     configured = str(config.get("codex_binary") or "")
     candidates = native_candidates + [configured] if config.get("prefer_native_codex", True) else [configured] + native_candidates
     discovered = shutil.which("codex")
@@ -791,6 +1017,14 @@ def resolve_codex_binary(config):
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
     return configured
+
+
+def codex_command(binary, *arguments):
+    """Build a directly executable command for native and npm Windows shims."""
+    binary = str(binary or "")
+    if IS_WINDOWS and Path(binary).suffix.lower() in {".cmd", ".bat"}:
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", binary, *arguments]
+    return [binary, *arguments]
 
 
 def cleanup_run_logs(config, now=None):
@@ -845,6 +1079,24 @@ def tail_json_objects(path, max_bytes=8 * 1024 * 1024):
     except OSError:
         return []
     return objects
+
+
+def iter_tail_json_objects(path, max_bytes=64 * 1024 * 1024):
+    """Stream a bounded rollout tail without retaining the whole file in RAM."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            start = max(0, size - max_bytes)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            for raw_line in handle:
+                try:
+                    yield json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+    except OSError:
+        return
 
 
 def as_epoch(value, fallback=None):
@@ -1250,7 +1502,7 @@ def build_provider_snapshot(
         }
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=3.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=3.0) as db:
             db.row_factory = sqlite3.Row
             log_columns = sqlite_columns(db, "proxy_request_logs")
             provider_columns = sqlite_columns(db, "providers")
@@ -1701,7 +1953,7 @@ def thread_paths_from_db(config, thread_ids):
         result = {}
         try:
             uri = db_path.resolve().as_uri() + "?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+            with sqlite_connection(uri, uri=True, timeout=2.0) as db:
                 columns = {row[1] for row in db.execute("PRAGMA table_info(threads)").fetchall()}
                 effort_column = ", reasoning_effort" if "reasoning_effort" in columns else ""
                 rows = db.execute(
@@ -1749,7 +2001,7 @@ def failed_thread_ids(config, opened_at, recovered_at):
         return result
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=2.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=2.0) as db:
             rows = db.execute(
                 """
                 SELECT DISTINCT session_id
@@ -1792,7 +2044,7 @@ def latest_success_after(config, started_at):
         return None
     uri = "file:{}?mode=ro".format(db_path)
     try:
-        with sqlite3.connect(uri, uri=True, timeout=3.0) as db:
+        with sqlite_connection(uri, uri=True, timeout=3.0) as db:
             row = db.execute(
                 """
                 SELECT MAX(created_at) FROM proxy_request_logs
@@ -1862,6 +2114,8 @@ def build_candidates(config, incident, state, now=None, include_pending=False):
 
 
 def notify(title, body):
+    if IS_WINDOWS:
+        return
     script = 'display notification {} with title {}'.format(json.dumps(body), json.dumps(title))
     try:
         subprocess.Popen(
@@ -1914,16 +2168,138 @@ class Watcher:
                 return True
         return False
 
-    def clear_reasoning_state(self, thread_id):
+    def clear_reasoning_state(self, thread_id, include_restore=False):
         for key in ("reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at"):
             self.state.setdefault(key, {}).pop(thread_id, None)
+        if include_restore:
+            self.state.setdefault("reasoning_restore_pending", {}).pop(thread_id, None)
+
+    def remember_reasoning_restore(self, thread_id, record, target_effort, fallback_effort, now):
+        target_effort = normalize_reasoning_effort(target_effort)
+        fallback_effort = normalize_reasoning_effort(fallback_effort)
+        if not target_effort or not fallback_effort or not reasoning_effort_is_lower(fallback_effort, target_effort):
+            return False
+        cooldown = max(60, int(self.config.get("capacity_reasoning_promote_after_seconds", 900)))
+        self.state.setdefault("reasoning_restore_pending", {})[thread_id] = {
+            "target_effort": target_effort,
+            "fallback_effort": fallback_effort,
+            "not_before": now + cooldown,
+            "last_capacity_at": now,
+            "title": (record or {}).get("title") or thread_id,
+            "rollout_path": str((record or {}).get("path") or ""),
+        }
+        return True
+
+    def discover_reasoning_restore_candidate(self, thread_id, record, now):
+        if not self.config.get("capacity_reasoning_promote_enabled", True):
+            return False
+        target = configured_reasoning_effort(self.config)
+        current = normalize_reasoning_effort((record or {}).get("reasoning_effort"))
+        path_text = str((record or {}).get("path") or "")
+        if not current or not path_text:
+            return False
+        pending = self.state.setdefault("reasoning_restore_pending", {})
+        existing = pending.get(thread_id) or {}
+        scans = self.state.setdefault("reasoning_restore_last_scan", {})
+        last_scan = int(scans.get(thread_id) or 0)
+        if last_scan and now - last_scan < 3600:
+            return False
+        scans[thread_id] = now
+        max_age = max(3600, int(float(self.config.get("model_retry_watch_hours", 24)) * 3600))
+        hint = reasoning_restore_hint(Path(path_text), target, now=now, max_age_seconds=max_age)
+        if not hint:
+            return False
+        detected_target = normalize_reasoning_effort(hint.get("target_effort"))
+        if not detected_target or not reasoning_effort_is_lower(current, detected_target):
+            return False
+        existing_target = normalize_reasoning_effort(existing.get("target_effort"))
+        if existing_target and not reasoning_effort_is_lower(existing_target, detected_target):
+            return False
+        cooldown = max(60, int(self.config.get("capacity_reasoning_promote_after_seconds", 900)))
+        pending[thread_id] = {
+            **existing,
+            **hint,
+            "not_before": max(now, int(hint.get("last_capacity_at") or now) + cooldown),
+            "title": (record or {}).get("title") or thread_id,
+            "rollout_path": path_text,
+        }
+        return True
+
+    def restore_due_desktop_reasoning(self, now):
+        if (
+            self.dry_run
+            or not self.config.get("capacity_reasoning_promote_enabled", True)
+            or not self.config.get("capacity_reasoning_desktop_sync_enabled", True)
+        ):
+            return False
+        pending = self.state.setdefault("reasoning_restore_pending", {})
+        due = sorted(
+            (
+                (thread_id, item)
+                for thread_id, item in pending.items()
+                if int((item or {}).get("not_before") or 0) <= now
+            ),
+            key=lambda pair: int((pair[1] or {}).get("not_before") or 0),
+        )
+        if not due:
+            return False
+        thread_id, item = due[0]
+        if self.is_inflight(thread_id=thread_id) or any(
+            queued.get("thread_id") == thread_id
+            for queued in (self.state.get("scheduled_retries") or []) + (self.state.get("queue") or [])
+        ):
+            item["not_before"] = now + 60
+            return True
+        record = thread_paths_from_db(self.config, {thread_id}).get(thread_id, {})
+        path_text = record.get("path") or item.get("rollout_path") or fallback_thread_path(self.config, thread_id)
+        if not path_text or not Path(path_text).is_file():
+            item["not_before"] = now + 300
+            item["last_error"] = "找不到 Codex 对话记录"
+            return True
+        status = latest_turn_status(Path(path_text))
+        if status.get("state") == "active":
+            item["not_before"] = now + 60
+            return True
+        target = normalize_reasoning_effort(item.get("target_effort"))
+        current = normalize_reasoning_effort(record.get("reasoning_effort"))
+        if not target:
+            pending.pop(thread_id, None)
+            return True
+        if current == target or (current and not reasoning_effort_is_lower(current, target)):
+            pending.pop(thread_id, None)
+            self.set_event(
+                "对话已经是“{}”档：{}".format(reasoning_effort_label(current or target), item.get("title") or thread_id),
+                now,
+            )
+            return True
+        result = update_thread_reasoning_effort(self.config, thread_id, target)
+        if result.get("ok"):
+            pending.pop(thread_id, None)
+            self.state["last_reasoning_restore_at"] = now
+            self.state["last_reasoning_restore_title"] = item.get("title") or thread_id
+            self.state["last_reasoning_restore_error"] = ""
+            self.set_event(
+                "Codex 对话已自动恢复为“{}”：{}".format(reasoning_effort_label(target), item.get("title") or thread_id),
+                now,
+            )
+            return True
+        item["not_before"] = now + 60
+        item["last_error"] = str(result.get("detail") or "Codex 对话档位同步失败")[:180]
+        self.state["last_reasoning_restore_error"] = item["last_error"]
+        warning_throttled(
+            "reasoning-restore-{}".format(thread_id),
+            "cannot restore Codex thread reasoning effort: %s",
+            item["last_error"],
+            interval=300,
+        )
+        return True
 
     def mark_blocked(self, item, reason, now):
         thread_id = item.get("thread_id")
         existing = self.state.setdefault("blocked", {}).get(thread_id)
         if existing and existing.get("turn_id") == item.get("turn_id"):
             return False
-        self.clear_reasoning_state(thread_id)
+        self.clear_reasoning_state(thread_id, include_restore=True)
         self.state.setdefault("blocked", {})[thread_id] = {
             "thread_id": thread_id,
             "turn_id": item.get("turn_id"),
@@ -2274,6 +2650,8 @@ class Watcher:
                 }
             next_effort = lower_reasoning_effort(current, minimum)
             self.state.setdefault("reasoning_efforts", {})[thread_id] = next_effort
+            if current != next_effort:
+                self.remember_reasoning_restore(thread_id, record, original, next_effort, now)
             return next_effort, {
                 "fallback": next_effort != current,
                 "from": current,
@@ -2407,6 +2785,7 @@ class Watcher:
             if not path_text:
                 continue
             record["path"] = path_text
+            changed = self.discover_reasoning_restore_candidate(thread_id, record, now) or changed
             status = latest_turn_status(Path(path_text))
             completed_at = as_epoch(status.get("completed_at"), 0) or 0
             if status.get("state") == "interrupted" and completed_at >= scan_floor:
@@ -2607,6 +2986,9 @@ class Watcher:
             self.state.setdefault("reasoning_efforts", {}).pop(item.get("thread_id"), None)
             self.state.setdefault("reasoning_originals", {}).pop(item.get("thread_id"), None)
             self.state.setdefault("reasoning_last_capacity_at", {}).pop(item.get("thread_id"), None)
+            # Do not discard reasoning_restore_pending here. A user may have
+            # continued the failed high-effort turn manually at medium; the
+            # idle Desktop sync still needs to restore the original tier.
             self.set_event("跳过已被手动恢复的任务：{}".format(item["title"]), now)
             save_state(self.state)
             return
@@ -2650,13 +3032,13 @@ class Watcher:
         save_state(self.state)
 
         log_handle = None
-        command = [
+        command = codex_command(
             resolve_codex_binary(self.config),
             "exec",
             "--skip-git-repo-check",
             "-c",
             "features.prevent_idle_sleep=true",
-        ]
+        )
         reasoning_effort = normalize_reasoning_effort(item.get("reasoning_effort"))
         if reasoning_effort:
             command.extend(["-c", 'model_reasoning_effort="{}"'.format(reasoning_effort)])
@@ -2667,7 +3049,8 @@ class Watcher:
         ])
         child_env = os.environ.copy()
         path_parts = list(self.config.get("extra_path", []))
-        path_parts.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+        if not IS_WINDOWS:
+            path_parts.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
         child_env["PATH"] = os.pathsep.join(dict.fromkeys(path_parts))
         try:
             log_handle = run_log.open("ab")
@@ -2739,10 +3122,13 @@ class Watcher:
         self.reconcile_circuit(now)
         self.discover_retryable_failures(now)
         self.refresh_provider_snapshot(now)
+        restore_changed = self.restore_due_desktop_reasoning(now)
         self.prepare_queue_if_ready(now)
         self.promote_due_retries(now)
         self.launch_next(now)
         self.maintenance(now)
+        if restore_changed:
+            save_state(self.state)
         self.state["heartbeat_at"] = int(time.time())
         self.state["last_tick_duration_ms"] = int((time.monotonic() - started) * 1000)
         self.state["last_internal_error"] = ""
@@ -2797,6 +3183,7 @@ def status_payload(config):
     state["codex_binary"] = resolved_binary
     state["codex_binary_exists"] = bool(resolved_binary and os.path.isfile(resolved_binary) and os.access(resolved_binary, os.X_OK))
     state["scheduled_retry_count"] = len(state.get("scheduled_retries") or [])
+    state["reasoning_restore_pending_count"] = len(state.get("reasoning_restore_pending") or {})
     state["inflight_count"] = len(state.get("inflight") or {})
     state["blocked_count"] = len(state.get("blocked") or {})
     state["heartbeat_age_seconds"] = heartbeat_age
@@ -2838,7 +3225,7 @@ def sleep_check_payload(config):
     if status.get("codex_binary_exists"):
         try:
             result = subprocess.run(
-                [binary, "login", "status"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                codex_command(binary, "login", "status"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, timeout=12, check=False,
             )
             login_ok = result.returncode == 0
@@ -2850,15 +3237,19 @@ def sleep_check_payload(config):
 
     power_ok = False
     power_detail = "无法读取供电状态"
-    try:
-        result = subprocess.run(
-            ["/usr/bin/pmset", "-g", "batt"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=5, check=False,
-        )
-        power_ok = "AC Power" in result.stdout
-        power_detail = "已接电；请保持开盖" if power_ok else "未接电；睡眠后无法自动续接"
-    except (OSError, subprocess.SubprocessError):
-        pass
+    if IS_WINDOWS:
+        power_ok = True
+        power_detail = "Windows 电源状态由系统电源计划管理；请关闭自动睡眠"
+    else:
+        try:
+            result = subprocess.run(
+                ["/usr/bin/pmset", "-g", "batt"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=5, check=False,
+            )
+            power_ok = "AC Power" in result.stdout
+            power_detail = "已接电；请保持开盖" if power_ok else "未接电；睡眠后无法自动续接"
+        except (OSError, subprocess.SubprocessError):
+            pass
     add("整夜供电", power_ok, power_detail)
 
     return {"ready": all(item["ok"] for item in checks), "checks": checks, "status": status}
@@ -2878,7 +3269,17 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def configure_standard_streams():
+    if not IS_WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv=None):
+    configure_standard_streams()
     args = parse_args(argv)
     setup_logging()
     config = load_config()

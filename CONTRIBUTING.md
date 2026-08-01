@@ -27,7 +27,7 @@ jq empty config.example.json
 zsh -n scripts/control.sh scripts/build_app.sh
 ```
 
-涉及 macOS 界面的修改还应运行 `./scripts/build_app.sh`，确认应用可以编译和启动。
+涉及 macOS 界面的修改还应运行 `./scripts/build_app.sh`，确认应用可以编译和启动。Windows 修改必须在 GitHub `windows-latest` CI 中通过 PSScriptAnalyzer、原生构建、安装生命周期烟测和 Defender 扫描。
 
 ## 设计原则
 
