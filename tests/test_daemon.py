@@ -56,6 +56,19 @@ class TurnStatusTests(unittest.TestCase):
             )
             self.assertEqual(daemon.latest_turn_status(path)["state"], "complete")
 
+    def test_windows_npm_codex_shim_uses_cmd_wrapper(self):
+        with mock.patch.object(daemon, "IS_WINDOWS", True), mock.patch.dict(
+            os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}
+        ):
+            command = daemon.codex_command(r"C:\Users\me\AppData\Roaming\npm\codex.cmd", "login", "status")
+        self.assertEqual(command[:4], [r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c"])
+        self.assertEqual(command[-3:], [r"C:\Users\me\AppData\Roaming\npm\codex.cmd", "login", "status"])
+
+    def test_windows_native_codex_exe_runs_directly(self):
+        with mock.patch.object(daemon, "IS_WINDOWS", True):
+            command = daemon.codex_command(r"C:\Tools\codex.exe", "exec")
+        self.assertEqual(command, [r"C:\Tools\codex.exe", "exec"])
+
     def test_overloaded_turn_is_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "rollout.jsonl"
@@ -434,6 +447,227 @@ class CodexStateDatabaseTests(unittest.TestCase):
 
 
 class ModelRetryTests(unittest.TestCase):
+    def _reasoning_state_db(self, root, thread_id, rollout, effort="medium"):
+        path = Path(root) / "state.db"
+        with sqlite3.connect(str(path)) as db:
+            db.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT, cwd TEXT, title TEXT, reasoning_effort TEXT)"
+            )
+            db.execute(
+                "INSERT INTO threads VALUES (?,?,?,?,?)",
+                (thread_id, str(rollout), str(root), "升档测试", effort),
+            )
+        return path
+
+    def test_capacity_fallback_remembers_desktop_restore(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"capacity_reasoning_promote_after_seconds": 900, "model_retry_jitter_seconds": 0})
+            watcher = daemon.Watcher(config)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            watcher.schedule_retry(
+                thread_id,
+                {"turn_id": "turn-capacity", "error": {"message": "Selected model is at capacity"}},
+                {"title": "桌面回升", "cwd": tmp, "path": str(Path(tmp) / "rollout.jsonl"), "reasoning_effort": "high"},
+                1000,
+                "retryable_error",
+            )
+            pending = watcher.state["reasoning_restore_pending"][thread_id]
+            self.assertEqual(pending["target_effort"], "high")
+            self.assertEqual(pending["fallback_effort"], "medium")
+            self.assertEqual(pending["not_before"], 1900)
+
+    def test_due_desktop_restore_updates_idle_thread(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-done", started_at=90),
+                    event("task_complete", turn_id="turn-done", completed_at=100, last_agent_message="done"),
+                ],
+            )
+            state_db = self._reasoning_state_db(root, thread_id, rollout)
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_state_db": str(state_db), "capacity_reasoning_promote_enabled": True})
+            watcher = daemon.Watcher(config)
+            watcher.state["reasoning_restore_pending"] = {
+                thread_id: {
+                    "target_effort": "high",
+                    "fallback_effort": "medium",
+                    "not_before": 100,
+                    "title": "升档测试",
+                    "rollout_path": str(rollout),
+                }
+            }
+            with mock.patch.object(daemon, "update_thread_reasoning_effort", return_value={"ok": True, "detail": "ok"}) as update:
+                watcher.restore_due_desktop_reasoning(101)
+            update.assert_called_once_with(config, thread_id, "high")
+            self.assertNotIn(thread_id, watcher.state["reasoning_restore_pending"])
+            self.assertIn("已自动恢复为“高”", watcher.state["last_event"])
+
+    def test_due_desktop_restore_waits_for_active_turn(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(rollout, [event("task_started", turn_id="turn-active", started_at=100)])
+            state_db = self._reasoning_state_db(root, thread_id, rollout)
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_state_db": str(state_db), "capacity_reasoning_promote_enabled": True})
+            watcher = daemon.Watcher(config)
+            watcher.state["reasoning_restore_pending"] = {
+                thread_id: {
+                    "target_effort": "high",
+                    "fallback_effort": "medium",
+                    "not_before": 100,
+                    "title": "执行中",
+                    "rollout_path": str(rollout),
+                }
+            }
+            with mock.patch.object(daemon, "update_thread_reasoning_effort") as update:
+                watcher.restore_due_desktop_reasoning(101)
+            update.assert_not_called()
+            self.assertIn(thread_id, watcher.state["reasoning_restore_pending"])
+            self.assertGreater(watcher.state["reasoning_restore_pending"][thread_id]["not_before"], 101)
+
+    def test_recent_manual_fallback_after_capacity_is_discovered(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-full", started_at=100),
+                    event(
+                        "task_complete",
+                        turn_id="turn-full",
+                        completed_at=110,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "medium"}),
+                    event("task_started", turn_id="turn-medium", started_at=120),
+                    event("task_complete", turn_id="turn-medium", completed_at=130, last_agent_message="done"),
+                ],
+            )
+            hint = daemon.reasoning_restore_hint(rollout, "high", now=150, max_age_seconds=3600)
+            self.assertIsNotNone(hint)
+            self.assertEqual(hint["fallback_effort"], "medium")
+            self.assertEqual(hint["target_effort"], "high")
+
+    def test_target_event_during_active_fallback_does_not_erase_restore_hint(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-full", started_at=100),
+                    event(
+                        "task_complete",
+                        turn_id="turn-full",
+                        completed_at=110,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "medium"}),
+                    event("task_started", turn_id="turn-medium", started_at=120),
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "high"}),
+                ],
+            )
+            state_db = self._reasoning_state_db(root, thread_id, rollout, effort="medium")
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_state_db": str(state_db), "capacity_reasoning_promote_after_seconds": 60})
+            watcher = daemon.Watcher(config)
+            record = daemon.thread_paths_from_db(config, {thread_id})[thread_id]
+            self.assertTrue(watcher.discover_reasoning_restore_candidate(thread_id, record, 130))
+            pending = watcher.state["reasoning_restore_pending"][thread_id]
+            self.assertEqual(pending["fallback_effort"], "medium")
+            self.assertEqual(pending["target_effort"], "high")
+
+    def test_desktop_restore_remembers_xhigh_selected_before_capacity(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(
+                rollout,
+                [
+                    event(
+                        "thread_settings_applied",
+                        thread_settings={"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
+                    ),
+                    event("task_started", turn_id="turn-xhigh", started_at=100),
+                    event(
+                        "task_complete",
+                        turn_id="turn-xhigh",
+                        completed_at=110,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                    event(
+                        "thread_settings_applied",
+                        thread_settings={"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+                    ),
+                ],
+            )
+            state_db = self._reasoning_state_db(root, thread_id, rollout, effort="high")
+            codex_config = root / "config.toml"
+            codex_config.write_text('model_reasoning_effort = "high"\n', encoding="utf-8")
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_state_db": str(state_db), "codex_config": str(codex_config)})
+            watcher = daemon.Watcher(config)
+            record = daemon.thread_paths_from_db(config, {thread_id})[thread_id]
+            self.assertTrue(watcher.discover_reasoning_restore_candidate(thread_id, record, 130))
+            pending = watcher.state["reasoning_restore_pending"][thread_id]
+            self.assertEqual(pending["fallback_effort"], "high")
+            self.assertEqual(pending["target_effort"], "xhigh")
+
+    def test_existing_high_restore_queue_is_upgraded_to_detected_xhigh(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(
+                rollout,
+                [
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "xhigh"}),
+                    event("task_complete", turn_id="full", completed_at=110, error={"message": "Selected model is at capacity"}),
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "medium"}),
+                ],
+            )
+            state_db = self._reasoning_state_db(root, thread_id, rollout, effort="medium")
+            config = {**daemon.DEFAULT_CONFIG, "codex_state_db": str(state_db)}
+            watcher = daemon.Watcher(config)
+            watcher.state["reasoning_restore_pending"] = {
+                thread_id: {"target_effort": "high", "fallback_effort": "medium", "not_before": 200}
+            }
+            record = daemon.thread_paths_from_db(config, {thread_id})[thread_id]
+            self.assertTrue(watcher.discover_reasoning_restore_candidate(thread_id, record, 130))
+            self.assertEqual(watcher.state["reasoning_restore_pending"][thread_id]["target_effort"], "xhigh")
+
+    def test_xhigh_capacity_falls_back_each_tier_then_promotes_to_xhigh(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"capacity_reasoning_promote_after_seconds": 60})
+            watcher = daemon.Watcher(config, dry_run=True)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            record = {"title": "极高降档", "reasoning_effort": "xhigh"}
+            for now, expected in ((100, "high"), (110, "medium"), (120, "low")):
+                effort, meta = watcher.prepare_reasoning_retry(
+                    thread_id, record, "Selected model is at capacity", now
+                )
+                self.assertEqual(effort, expected)
+                self.assertTrue(meta["fallback"])
+                record["reasoning_effort"] = expected
+            effort, meta = watcher.prepare_reasoning_retry(
+                thread_id, record, "503 temporarily unavailable", 200
+            )
+            self.assertEqual(effort, "xhigh")
+            self.assertTrue(meta["promotion"])
+
     def test_capacity_fallback_moves_high_to_medium_to_low_and_stops(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             config = dict(daemon.DEFAULT_CONFIG)
@@ -862,10 +1096,35 @@ class ReliabilityTests(unittest.TestCase):
             watcher.state["reasoning_efforts"] = {self.thread_id: "low"}
             watcher.state["reasoning_originals"] = {self.thread_id: "high"}
             watcher.state["reasoning_last_capacity_at"] = {self.thread_id: now - 10}
+            watcher.state["reasoning_restore_pending"] = {
+                self.thread_id: {
+                    "target_effort": "high",
+                    "fallback_effort": "low",
+                    "not_before": now + 900,
+                }
+            }
             watcher.finish_inflight(item, 0, now)
             self.assertNotIn(self.thread_id, watcher.state["reasoning_efforts"])
             self.assertNotIn(self.thread_id, watcher.state["reasoning_originals"])
             self.assertNotIn(self.thread_id, watcher.state["reasoning_last_capacity_at"])
+            self.assertIn(self.thread_id, watcher.state["reasoning_restore_pending"])
+
+    def test_dry_run_never_updates_desktop_reasoning(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            config = dict(daemon.DEFAULT_CONFIG)
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["reasoning_restore_pending"] = {
+                self.thread_id: {
+                    "target_effort": "high",
+                    "fallback_effort": "medium",
+                    "not_before": 100,
+                }
+            }
+            with mock.patch.object(daemon, "update_thread_reasoning_effort") as update:
+                changed = watcher.restore_due_desktop_reasoning(101)
+            self.assertFalse(changed)
+            update.assert_not_called()
+            self.assertIn(self.thread_id, watcher.state["reasoning_restore_pending"])
 
     def test_corrupt_primary_recovers_queue_from_backup(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):

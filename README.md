@@ -3,9 +3,10 @@
 [![CI](https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml/badge.svg)](https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)](#环境要求)
-[![Release](https://img.shields.io/badge/release-2.6.0-blue)](CHANGELOG.md)
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%2F11-blue?logo=windows)](#环境要求)
+[![Release](https://img.shields.io/badge/release-2.7.0-blue)](CHANGELOG.md)
 
-一个面向 macOS、CC Switch 与 Codex Desktop 的本地守望工具。它监控中转线路熔断、模型池满载和临时网关故障，在条件恢复后继续原 Codex 对话，并提供渠道健康、真实倍率、人民币费用及 Claude Desktop 渠道状态总览。
+一个面向 macOS、Windows、CC Switch 与 Codex Desktop 的本地守望工具。它监控中转线路熔断、模型池满载和临时网关故障，在条件恢复后继续原 Codex 对话，并提供渠道健康、真实倍率、人民币费用及 Claude Desktop 渠道状态总览。
 
 > 这是社区维护的非官方项目，与 OpenAI、Codex 或 CC Switch 官方无隶属关系。
 
@@ -35,9 +36,10 @@ Codex Circuit Resumer 将这些情况收敛成一个轻量的本地后台守望�
 
 - 推理强度可按 `xhigh -> high -> medium -> low` 逐档降低；
 - 默认最低停在 `low`，不会无限降低；
-- 降档后每 15 分钟尝试回到原推理强度；
-- 通过单次 CLI 配置覆盖实现，不修改用户的全局 Codex 设置；
-- 已经运行中的单次请求不会被强制终止，升档在下一次安全续接时生效。
+- 降档后保留原始推理强度，每 15 分钟进入一次安全回升窗口；
+- 自动续接使用单次 CLI 覆盖；对话空闲后再通过 Codex 官方对话设置接口同步回原档位，不修改全局设置；
+- 原档位按每个对话首次发生满载前的实际选择保存：极高按“极高 → 高 → 中 → 低”降级并恢复极高，高档则恢复高档；
+- 已经运行中的单次请求不会被强制终止，恢复后的档位从下一次请求生效。
 
 ### CC Switch 渠道体检
 
@@ -58,7 +60,7 @@ Codex Circuit Resumer 将这些情况收敛成一个轻量的本地后台守望�
 
 ### 本地可靠性与隐私
 
-- 使用 macOS LaunchAgent 后台运行，关闭窗口不影响守望；
+- macOS 使用 LaunchAgent，Windows 使用当前用户计划任务后台运行，关闭窗口不影响守望；
 - 接电时通过 `caffeinate -s` 减少夜间系统睡眠造成的中断；
 - 状态原子写入并保留安全备份，可接管异常退出后的遗留续接进程；
 - 日志轮转并限制保留数量；
@@ -85,7 +87,7 @@ CC Switch / Codex rollout
 
 ## 环境要求
 
-- macOS 13 Ventura 或更高版本；
+- macOS 13 Ventura 或更高版本（Apple Silicon）；或 Windows 10/11 x64；
 - 已安装并配置 CC Switch；
 - 已安装 Codex Desktop，或系统中存在可用的 Codex CLI；
 - Codex 已完成登录；
@@ -94,6 +96,8 @@ CC Switch / Codex rollout
 当前实现主要在 Apple Silicon Mac 上验证。Intel Mac 理论上可运行 Python 后台，但默认构建脚本生成 arm64 应用，需要自行调整 Swift 编译目标。
 
 ## 快速开始
+
+### macOS
 
 ```bash
 git clone https://github.com/loveramarois-byte/codex-circuit-resumer.git
@@ -125,6 +129,17 @@ open "dist/Codex熔断续聊.app"
 
 卸载不会删除 CC Switch 或 Codex 数据。
 
+### Windows
+
+从 [GitHub Releases](https://github.com/loveramarois-byte/codex-circuit-resumer/releases) 下载 `CodexCircuitResumer-Windows-x64.zip`，解压后双击 `Install.cmd`。如果系统拦截脚本，也可以右键 `Install.ps1`，选择“使用 PowerShell 运行”。安装程序会：
+
+- 安装到 `%LOCALAPPDATA%\CodexCircuitResumer\app`；
+- 在桌面创建“Codex 熔断续聊”快捷方式；
+- 优先创建当前用户计划任务；如果系统不允许，再回退到注册表登录自启，避免重复启动，不要求管理员权限；
+- 保留配置和日志，重复安装可直接升级。
+
+卸载后台与快捷方式时运行解压目录中的 `Uninstall.ps1`。Windows 包目前没有商业 Authenticode 证书签名，首次下载可能显示 SmartScreen 提示；请先对照同一 Release 的 `.sha256` 文件验证哈希。
+
 ## 界面说明
 
 - **总览**：后台健康、正在续接、待重试和需人工处理；
@@ -148,6 +163,7 @@ open "dist/Codex熔断续聊.app"
 | `capacity_reasoning_minimum` | `low` | 自动降档最低档位 |
 | `capacity_reasoning_promote_enabled` | `true` | 定期尝试恢复原推理强度 |
 | `capacity_reasoning_promote_after_seconds` | `900` | 恢复探测间隔 |
+| `capacity_reasoning_desktop_sync_enabled` | `true` | 空闲时把 Codex Desktop 对话同步回原档位 |
 | `max_candidates_per_incident` | `8` | 每批续接数量；超过后自动排队，不会丢失 |
 | `provider_snapshot_seconds` | `30` | 渠道与费用快照间隔 |
 
@@ -162,13 +178,13 @@ open "dist/Codex熔断续聊.app"
 
 ## 已知限制
 
-- 目前仅提供 macOS 桌面端和 LaunchAgent 集成；
 - 依赖 CC Switch SQLite 表结构、日志格式以及 Codex rollout/state DB，相关上游版本变化可能需要适配；
-- 无法在一个已经运行的 Codex 请求中途热切换推理强度，只能在下一次续接时调整；
+- 无法在一个已经运行的 Codex 请求中途热切换推理强度；自动恢复的档位从下一次请求生效；
 - 网站真实倍率和余额查询只覆盖已识别的接口，未识别站点会显示“无法验证”；
 - 折后费用根据网站当前倍率估算，不等同于充值平台最终账单或历史结算单；
 - 合盖、退出 macOS 登录会话或电池睡眠属于系统级暂停，LaunchAgent 无法绕过；
 - 当前应用使用 ad-hoc 签名，尚未提供 Apple Developer ID 公证发行包；
+- Windows 可执行文件尚未使用商业 Authenticode 证书签名，可能触发 SmartScreen；GitHub Release 提供 SHA-256，CI 使用 Microsoft Defender 扫描；
 - 该工具不能解决失效账号、人工审批、MCP 配置错误或永久性模型不兼容。
 
 ## 开发与验证
@@ -183,6 +199,8 @@ python3 tests/real_machine_drill.py --app "dist/Codex熔断续聊.app"
 ```
 
 实机操练覆盖故障续接、模型满载降档、OpenResty HTML 400 换线、真实渠道快照、状态恢复、睡前检查和应用启动。
+
+Windows CI 在 GitHub 官方 `windows-latest` 虚拟机上执行 Python 回归、PSScriptAnalyzer、PyInstaller 原生构建、安装/计划任务/启动/状态/停止/卸载烟测、Microsoft Defender 自定义扫描和 SHA-256 生成。macOS CI 独立编译、签名检查和回归测试，两个平台必须同时通过才会发布。
 
 ## 安全
 

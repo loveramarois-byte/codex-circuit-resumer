@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use semantic versioning where practical.
 
+## [2.7.0] - 2026-08-02
+
+### Added
+
+- Windows 10/11 x64 图形界面、独立后台 EXE、双击安装入口、桌面快捷方式和当前用户计划任务开机自启。
+- Windows 可重复安装升级、停止与卸载脚本，不要求管理员权限。
+- 双平台 GitHub Release 工作流，同步发布 macOS arm64 与 Windows x64 压缩包及 SHA-256。
+
+### Changed
+
+- 共享监控核心支持 Windows 应用数据目录、Codex npm 路径、进程识别、管道等待与电源检查。
+- 档位恢复目标按每个对话满载前实际选择记录，完整支持“极高 → 高 → 中 → 低”并恢复原档位。
+
+### Verified
+
+- Windows CI 覆盖单元测试、PSScriptAnalyzer、完整安装生命周期烟测与 Microsoft Defender 扫描。
+- macOS CI 覆盖单元测试、Swift 类型检查、应用构建与签名检查；本地保留 50 次进程级操练脚本。
+
+## [2.6.1] - 2026-08-01
+
+- 修复桌面升档目标误取全局配置的问题：现在记住每个对话满载前实际选择的原档位，完整支持“极高 → 高 → 中 → 低”逐档降级并恢复极高。
+
+### Fixed
+
+- Preserve the original reasoning tier after a successful lower-tier recovery instead of discarding promotion state.
+- Restore an idle Codex Desktop thread through the official `thread/settings/update` app-server method after the capacity cooldown.
+- Detect a manual high-to-medium fallback that immediately follows a Desktop capacity failure and still schedule the safe promotion.
+- Never change the effort of a turn that is already running; the restored tier applies to the next request.
+
+### Verified
+
+- Added regression coverage for pending promotion, active-turn protection, Desktop synchronization, and manual fallback discovery.
+
 ## [2.6.0] - 2026-08-01
 
 ### Added

@@ -1,64 +1,44 @@
-name: CI
+name: Release
 
 on:
   push:
-  pull_request:
+    tags: ['v*']
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   macos:
     runs-on: macos-14
-    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-
-      - name: Validate Python and configuration
+      - name: Build and package macOS
         run: |
-          python3 -m unittest discover -s tests -v
-          python3 -m py_compile src/daemon.py tests/real_machine_drill.py
-          jq empty config.example.json
-          zsh -n scripts/control.sh scripts/build_app.sh
-
-      - name: Build macOS app
-        run: |
-          ./scripts/build_app.sh "$RUNNER_TEMP/CodexCircuitResumer.app"
-          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/CodexCircuitResumer.app"
+          ./scripts/build_app.sh "$RUNNER_TEMP/Codex熔断续聊.app"
+          codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Codex熔断续聊.app"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Codex熔断续聊.app" "$RUNNER_TEMP/CodexCircuitResumer-macOS-arm64.zip"
+          shasum -a 256 "$RUNNER_TEMP/CodexCircuitResumer-macOS-arm64.zip" > "$RUNNER_TEMP/CodexCircuitResumer-macOS-arm64.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: ${{ runner.temp }}/CodexCircuitResumer-macOS-arm64.zip*
 
   windows:
     runs-on: windows-latest
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-
-      - name: Python tests on Windows
+      - name: Test, analyze, build and scan
         shell: pwsh
         run: |
           python -m unittest discover -s tests -v
-          python -m py_compile src/daemon.py tests/real_machine_drill.py windows/gui.py
-
-      - name: Analyze PowerShell
-        shell: pwsh
-        run: |
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
           $results = Invoke-ScriptAnalyzer -Path windows -Recurse -Severity Error,Warning
-          $results | Format-Table -AutoSize
-          if ($results) { throw "PSScriptAnalyzer found $($results.Count) issue(s)." }
-
-      - name: Build and smoke-test Windows package
-        shell: pwsh
-        run: |
+          if ($results) { $results | Format-Table -AutoSize; throw 'PowerShell analysis failed.' }
           ./windows/build_windows.ps1 -OutputDir "$env:RUNNER_TEMP\windows-dist"
           ./windows/smoke_test.ps1 -Stage "$env:RUNNER_TEMP\windows-dist\CodexCircuitResumer-Windows-x64"
-
-      - name: Microsoft Defender custom scan
-        shell: pwsh
-        run: |
           try { Update-MpSignature -ErrorAction Stop } catch { Write-Warning "Defender signature update unavailable: $($_.Exception.Message)" }
           $defender = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
           if (-not (Test-Path $defender)) {
@@ -68,8 +48,23 @@ jobs:
           if (-not $defender -or -not (Test-Path $defender)) { throw 'Microsoft Defender MpCmdRun.exe was not found.' }
           & $defender -Scan -ScanType 3 -File "$env:RUNNER_TEMP\windows-dist" -DisableRemediation
           if ($LASTEXITCODE -ne 0) { throw "Microsoft Defender scan failed with code $LASTEXITCODE." }
-
       - uses: actions/upload-artifact@v4
         with:
-          name: CodexCircuitResumer-Windows-x64
-          path: ${{ runner.temp }}/windows-dist/*
+          name: windows-release
+          path: |
+            ${{ runner.temp }}/windows-dist/CodexCircuitResumer-Windows-x64.zip
+            ${{ runner.temp }}/windows-dist/CodexCircuitResumer-Windows-x64.zip.sha256
+
+  publish:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" artifacts/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "${GITHUB_REF_NAME} · macOS 与 Windows 同步版"
