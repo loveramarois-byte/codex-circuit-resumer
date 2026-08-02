@@ -6,7 +6,7 @@
 
 请先确认问题可以在最新版复现，并提供：
 
-- macOS、CC Switch 和 Codex 版本；
+- 操作系统及版本（macOS 或 Windows）、CC Switch 和 Codex 版本；
 - 期望行为与实际行为；
 - 已脱敏的错误信息；
 - 最小复现步骤。

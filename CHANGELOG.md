@@ -26,7 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - 95 unit tests plus a macOS build-rollback integration test.
 - 50 process-level macOS drills.
-- macOS app build and Windows Python/static syntax checks.
+- macOS app build plus Windows package build, install lifecycle smoke test, PSScriptAnalyzer, and Microsoft Defender scan.
 
 ## [2.7.1] - 2026-08-02
 
