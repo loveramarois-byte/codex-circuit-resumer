@@ -716,7 +716,15 @@ class ModelRetryTests(unittest.TestCase):
             self.assertEqual(watcher.state["reasoning_restore_pending"][thread_id]["restore_failures"], 2)
             self.assertEqual(watcher.state["reasoning_restore_pending"][thread_id]["not_before"], 1001)
 
-    def test_recent_manual_fallback_after_capacity_is_discovered(self):
+    def test_empty_restore_queue_clears_stale_error(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["last_reasoning_restore_error"] = "Codex 未确认保存目标档位"
+
+            self.assertTrue(watcher.restore_due_desktop_reasoning(100))
+            self.assertEqual(watcher.state["last_reasoning_restore_error"], "")
+
+    def test_auto_fallback_after_capacity_is_discovered(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             root = Path(tmp)
             thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
@@ -731,6 +739,7 @@ class ModelRetryTests(unittest.TestCase):
                         completed_at=110,
                         error={"message": "Selected model is at capacity"},
                     ),
+                    event("user_message", message="继续\n[Codex熔断续聊:auto-restore]"),
                     event("thread_settings_applied", thread_settings={"reasoning_effort": "medium"}),
                     event("task_started", turn_id="turn-medium", started_at=120),
                     event("task_complete", turn_id="turn-medium", completed_at=130, last_agent_message="done"),
@@ -740,6 +749,70 @@ class ModelRetryTests(unittest.TestCase):
             self.assertIsNotNone(hint)
             self.assertEqual(hint["fallback_effort"], "medium")
             self.assertEqual(hint["target_effort"], "high")
+
+    def test_manual_fallback_after_capacity_does_not_create_restore_hint(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            rollout = Path(tmp) / "rollout.jsonl"
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-full", started_at=100),
+                    event(
+                        "task_complete",
+                        turn_id="turn-full",
+                        completed_at=110,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "medium"}),
+                    event("task_started", turn_id="turn-manual", started_at=120),
+                    event("user_message", message="继续"),
+                ],
+            )
+
+            hint = daemon.reasoning_restore_hint(rollout, "high", now=150, max_age_seconds=3600)
+
+            self.assertIsNone(hint)
+
+    def test_stale_restore_pending_is_cleared_after_manual_continue(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / "rollout.jsonl"
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-full", started_at=100),
+                    event(
+                        "task_complete",
+                        turn_id="turn-full",
+                        completed_at=110,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                    event("thread_settings_applied", thread_settings={"reasoning_effort": "medium"}),
+                    event("task_started", turn_id="turn-manual", started_at=120),
+                    event("user_message", message="继续"),
+                ],
+            )
+            state_db = self._reasoning_state_db(root, thread_id, rollout, effort="medium")
+            codex_config = root / "config.toml"
+            codex_config.write_text('model_reasoning_effort = "high"\n', encoding="utf-8")
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_state_db": str(state_db), "codex_config": str(codex_config)})
+            watcher = daemon.Watcher(config)
+            watcher.state["reasoning_restore_pending"] = {
+                thread_id: {
+                    "target_effort": "high",
+                    "fallback_effort": "medium",
+                    "last_capacity_at": 110,
+                    "not_before": 1000,
+                    "rollout_path": str(rollout),
+                }
+            }
+            record = daemon.thread_paths_from_db(config, {thread_id})[thread_id]
+
+            self.assertTrue(watcher.discover_reasoning_restore_candidate(thread_id, record, 150))
+            self.assertNotIn(thread_id, watcher.state["reasoning_restore_pending"])
+            self.assertIn("手动切换模型", watcher.state["last_event"])
 
     def test_target_event_during_active_fallback_does_not_erase_restore_hint(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):

@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use semantic versioning where practical.
 
+## [Unreleased]
+
+### Fixed
+
+- Treat an unmarked Codex user Continue after a capacity error as a manual model/tier intervention, never as the app's automatic fallback or tier restoration.
+- Remove stale pending tier-restoration entries and their old error text after a manual intervention.
+- Re-scan a rollout immediately when it changes, instead of waiting for the previous one-hour tier scan interval.
+
+### Verified
+
+- 101 unit tests and 50 process-level macOS drills.
+
 ## [2.8.0] - 2026-08-02
 
 ### Added

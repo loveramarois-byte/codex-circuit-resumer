@@ -818,6 +818,40 @@ def event_epoch(event, fallback=0):
     return int(fallback or 0)
 
 
+def event_user_message(event):
+    """Return a user-authored message from either rollout user-message shape."""
+    payload = event.get("payload") or {}
+    payload_type = payload.get("type")
+    if payload_type == "user_message":
+        message = payload.get("message")
+        return message if isinstance(message, str) else None
+    if event.get("type") != "response_item" or payload_type != "message":
+        return None
+    if payload.get("role") != "user":
+        return None
+    parts = [
+        content["text"]
+        for content in payload.get("content") or []
+        if isinstance(content, dict) and isinstance(content.get("text"), str)
+    ]
+    return "".join(parts) if parts else None
+
+
+def has_manual_intervention_after(path, since, now=None):
+    """Detect an unmarked user turn after a capacity event."""
+    since = int(since or 0)
+    if not since:
+        return False
+    fallback = int(now if now is not None else time.time())
+    for event in iter_tail_json_objects(Path(path)):
+        message = event_user_message(event)
+        if message is None or "[Codex熔断续聊:" in message:
+            continue
+        if event_epoch(event, fallback) >= since:
+            return True
+    return False
+
+
 def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400):
     """Find a recent capacity error followed by a lower Desktop thread setting."""
     default_target = normalize_reasoning_effort(target_effort)
@@ -827,11 +861,26 @@ def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400)
     last_capacity_at = 0
     fallback_effort = None
     fallback_at = 0
+    manual_intervention = False
     for event in iter_tail_json_objects(Path(path)):
         if event.get("type") != "event_msg":
+            message = event_user_message(event)
+            if message is not None and last_capacity_at:
+                message_at = event_epoch(event, last_capacity_at or now)
+                if message_at >= last_capacity_at and "[Codex熔断续聊:" not in message:
+                    manual_intervention = True
+                    fallback_effort = None
+                    fallback_at = 0
             continue
         payload = event.get("payload") or {}
         payload_type = payload.get("type")
+        message = event_user_message(event)
+        if message is not None and last_capacity_at:
+            message_at = event_epoch(event, last_capacity_at or now)
+            if message_at >= last_capacity_at and "[Codex熔断续聊:" not in message:
+                manual_intervention = True
+                fallback_effort = None
+                fallback_at = 0
         if payload_type == "task_complete":
             error = payload.get("error")
             error_text = json.dumps(error, ensure_ascii=False) if error else ""
@@ -844,6 +893,7 @@ def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400)
                 last_capacity_at = event_epoch(event, now)
                 fallback_effort = None
                 fallback_at = 0
+                manual_intervention = False
         elif payload_type == "thread_settings_applied":
             effort = normalize_reasoning_effort(
                 (payload.get("thread_settings") or {}).get("reasoning_effort")
@@ -857,8 +907,13 @@ def reasoning_restore_hint(path, target_effort, now=None, max_age_seconds=86400)
             # is still active; that turn may write its lower setting back to
             # the database without another rollout settings event. Keep the
             # fallback hint until the database itself reaches the target.
-            if last_capacity_at and applied_at >= last_capacity_at and reasoning_effort_is_lower(
-                effort, restore_target or default_target
+            if (
+                not manual_intervention
+                and last_capacity_at
+                and applied_at >= last_capacity_at
+                and reasoning_effort_is_lower(
+                    effort, restore_target or default_target
+                )
             ):
                 fallback_effort = effort
                 fallback_at = applied_at
@@ -2292,12 +2347,29 @@ class Watcher:
         existing = pending.get(thread_id) or {}
         scans = self.state.setdefault("reasoning_restore_last_scan", {})
         last_scan = int(scans.get(thread_id) or 0)
-        if last_scan and now - last_scan < 3600:
+        try:
+            path_updated_at = int(Path(path_text).stat().st_mtime)
+        except OSError:
+            path_updated_at = 0
+        if last_scan and now - last_scan < 3600 and path_updated_at <= last_scan:
             return False
         scans[thread_id] = now
         max_age = max(3600, int(float(self.config.get("model_retry_watch_hours", 24)) * 3600))
         hint = reasoning_restore_hint(Path(path_text), target, now=now, max_age_seconds=max_age)
         if not hint:
+            if existing and has_manual_intervention_after(
+                Path(path_text), existing.get("last_capacity_at"), now=now
+            ):
+                self.clear_reasoning_state(thread_id, include_restore=True)
+                scans[thread_id] = now
+                self.state["last_reasoning_restore_error"] = ""
+                self.set_event(
+                    "检测到你手动切换模型，已取消自动档位恢复：{}".format(
+                        (record or {}).get("title") or thread_id
+                    ),
+                    now,
+                )
+                return True
             return False
         detected_target = normalize_reasoning_effort(hint.get("target_effort"))
         if not detected_target or not reasoning_effort_is_lower(current, detected_target):
@@ -2332,6 +2404,9 @@ class Watcher:
             key=lambda pair: int((pair[1] or {}).get("not_before") or 0),
         )
         if not due:
+            if not pending and self.state.get("last_reasoning_restore_error"):
+                self.state["last_reasoning_restore_error"] = ""
+                return True
             return False
         thread_id, item = due[0]
         if self.is_inflight(thread_id=thread_id) or any(
