@@ -14,5 +14,10 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Copy-Item (Join-Path $Project 'windows\control.ps1'), (Join-Path $Project 'windows\Install.ps1'), (Join-Path $Project 'windows\Install.cmd'), (Join-Path $Project 'windows\Uninstall.ps1'), (Join-Path $Project 'config.example.json') $Stage
 Get-ChildItem $Stage -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  $($_.Path | Split-Path -Leaf)" } | Set-Content (Join-Path $Stage 'SHA256SUMS.txt') -Encoding ascii
 Compress-Archive -Path $Stage -DestinationPath (Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64.zip') -CompressionLevel Optimal
-Get-FileHash (Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64.zip') -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  CodexCircuitResumer-Windows-x64.zip" } | Set-Content (Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64.zip.sha256') -Encoding ascii
+$ZipHash = (Get-FileHash (Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64.zip') -Algorithm SHA256).Hash.ToLower()
+[System.IO.File]::WriteAllText(
+    (Join-Path $OutputDir 'CodexCircuitResumer-Windows-x64.zip.sha256'),
+    "$ZipHash  CodexCircuitResumer-Windows-x64.zip`n",
+    [System.Text.Encoding]::ASCII
+)
 Write-Output $OutputDir
