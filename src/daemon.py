@@ -2587,8 +2587,6 @@ class Watcher:
             "recovered_at": None,
             "source_line": line.strip()[-500:],
         }
-        self.state["queue"] = []
-        self.state["candidate_backlog"] = []
         self.set_event("检测到 CC Switch 熔断，开始记录受影响任务", when)
         save_state(self.state)
 
@@ -2669,6 +2667,18 @@ class Watcher:
         candidates, pending = build_candidates(
             self.config, incident, self.state, now, include_pending=True
         )
+        carryover = list(self.state.get("queue") or []) + list(
+            self.state.get("candidate_backlog") or []
+        )
+        merged_candidates = []
+        seen = set()
+        for item in carryover + candidates:
+            key = (item.get("thread_id"), item.get("turn_id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_candidates.append(item)
+        candidates = merged_candidates
         batch_size = max(1, int(self.config.get("max_candidates_per_incident", 8)))
         self.state["queue"] = candidates[:batch_size]
         self.state["candidate_backlog"] = candidates[batch_size:]
@@ -2677,7 +2687,7 @@ class Watcher:
             total = len(candidates)
             queued = len(self.state["queue"])
             remaining = len(self.state["candidate_backlog"])
-            message = "找到 {} 条中断任务，开始串行续接".format(total)
+            message = "找到 {} 条中断任务，开始安全续接".format(total)
             if remaining:
                 message = "找到 {} 条中断任务，先续接 {} 条，另有 {} 条已安全排队".format(
                     total, queued, remaining

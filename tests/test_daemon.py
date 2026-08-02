@@ -454,6 +454,38 @@ class DetectionTests(unittest.TestCase):
                 self.assertEqual(watcher.state["phase"], "resuming")
                 self.assertEqual(len(watcher.state["candidate_backlog"]), 0)
 
+    def test_new_circuit_open_preserves_previous_pending_queue(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            config = {
+                **daemon.DEFAULT_CONFIG,
+                "max_candidates_per_incident": 2,
+                "recovery_grace_seconds": 0,
+            }
+            watcher = daemon.Watcher(config, dry_run=True)
+            old_item = {"thread_id": "thread-old", "turn_id": "turn-old", "title": "旧队列"}
+            backlog_item = {
+                "thread_id": "thread-backlog",
+                "turn_id": "turn-backlog",
+                "title": "旧候补",
+            }
+            new_item = {"thread_id": "thread-new", "turn_id": "turn-new", "title": "新任务"}
+            watcher.state["phase"] = "resuming"
+            watcher.state["queue"] = [old_item]
+            watcher.state["candidate_backlog"] = [backlog_item]
+
+            watcher.handle_open(100, "Open")
+            watcher.handle_closed(101, "Closed")
+            with mock.patch.object(
+                daemon,
+                "build_candidates",
+                return_value=([dict(old_item), new_item], []),
+            ):
+                watcher.prepare_queue_if_ready(101)
+
+            self.assertEqual(watcher.state["queue"], [old_item, backlog_item])
+            self.assertEqual(watcher.state["candidate_backlog"], [new_item])
+            self.assertEqual(watcher.state["phase"], "resuming")
+
     def test_maintenance_uses_hours_not_double_hours(self):
         state = daemon.initial_state()
         now = 200000
