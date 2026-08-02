@@ -75,6 +75,37 @@ class TurnStatusTests(unittest.TestCase):
             status = daemon.latest_turn_status(path)
             self.assertEqual(status["user_message"], "继续\n[Codex熔断续聊:auto-123]")
 
+    def test_turn_status_reads_response_item_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            write_events(
+                path,
+                [
+                    event("task_started", turn_id="turn-response-item", started_at=100),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "继续"},
+                                {"type": "input_text", "text": "\n[Codex熔断续聊:auto-456]"},
+                            ],
+                        },
+                    },
+                    event(
+                        "task_complete",
+                        turn_id="turn-response-item",
+                        completed_at=110,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+
+            status = daemon.latest_turn_status(path)
+
+            self.assertEqual(status["user_message"], "继续\n[Codex熔断续聊:auto-456]")
+
     def test_windows_npm_codex_shim_uses_cmd_wrapper(self):
         with mock.patch.object(daemon, "IS_WINDOWS", True), mock.patch.dict(
             os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}
@@ -403,12 +434,18 @@ class DetectionTests(unittest.TestCase):
         now = 200000
         state["last_cleanup_at"] = 0
         state["resumed_turns"] = {"old": {"resumed_at": now - 86401}}
+        state["recovery_attributions"] = {
+            "old": {"recorded_at": now - 86401},
+            "recent": {"recorded_at": now - 60},
+        }
         with tempfile.TemporaryDirectory() as tmp:
             with isolated_runtime(Path(tmp)):
                 watcher = daemon.Watcher({**daemon.DEFAULT_CONFIG, "model_retry_watch_hours": 24}, dry_run=True)
                 watcher.state = state
                 watcher.maintenance(now)
                 self.assertNotIn("old", watcher.state["resumed_turns"])
+                self.assertNotIn("old", watcher.state["recovery_attributions"])
+                self.assertIn("recent", watcher.state["recovery_attributions"])
 
     def test_runtime_path_contains_user_node_locations(self):
         config = dict(daemon.DEFAULT_CONFIG)
@@ -1313,6 +1350,30 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(watcher.state["resume_success_count"], 1)
             self.assertEqual(watcher.state["manual_recovery_count"], 0)
             self.assertIn("自动续接成功", watcher.state["last_event"])
+
+    def test_completed_recovery_attribution_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            marker = "idempotent-marker"
+            item = {
+                "thread_id": self.thread_id,
+                "turn_id": "turn-failed",
+                "title": "只计一次",
+                "resume_marker": marker,
+            }
+            current = {
+                "state": "complete",
+                "turn_id": "turn-auto",
+                "user_message": "继续\n[Codex熔断续聊:{}]".format(marker),
+            }
+
+            first = watcher.record_completed_recovery(item, current, 100)
+            second = watcher.record_completed_recovery(item, current, 101)
+
+            self.assertEqual(first, "auto")
+            self.assertEqual(second, "auto")
+            self.assertEqual(watcher.state["resume_success_count"], 1)
+            self.assertEqual(len(watcher.state["recovery_attributions"]), 1)
 
     def test_manual_continue_is_not_counted_as_auto_resume_success(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
