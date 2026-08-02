@@ -17,7 +17,8 @@ jobs:
           ./scripts/build_app.sh "$RUNNER_TEMP/Codex熔断续聊.app"
           codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/Codex熔断续聊.app"
           ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Codex熔断续聊.app" "$RUNNER_TEMP/CodexCircuitResumer-macOS-arm64.zip"
-          shasum -a 256 "$RUNNER_TEMP/CodexCircuitResumer-macOS-arm64.zip" > "$RUNNER_TEMP/CodexCircuitResumer-macOS-arm64.zip.sha256"
+          cd "$RUNNER_TEMP"
+          shasum -a 256 CodexCircuitResumer-macOS-arm64.zip > CodexCircuitResumer-macOS-arm64.zip.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: macos-release
