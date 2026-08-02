@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="720" viewBox="0 0 1440 720" role="img" aria-labelledby="title description">
+  <title id="title">Codex Circuit Resumer</title>
+  <desc id="description">A warm editorial illustration of API routes recovering and reconnecting interrupted coding conversations.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="160%">
+      <feDropShadow dx="0" dy="18" stdDeviation="24" flood-color="#271E18" flood-opacity="0.10"/>
+    </filter>
+    <pattern id="grain" width="56" height="56" patternUnits="userSpaceOnUse">
+      <circle cx="4" cy="8" r="0.8" fill="#3C2E25" opacity="0.055"/>
+      <circle cx="31" cy="20" r="0.65" fill="#3C2E25" opacity="0.045"/>
+      <circle cx="17" cy="45" r="0.7" fill="#3C2E25" opacity="0.04"/>
+      <circle cx="48" cy="39" r="0.55" fill="#3C2E25" opacity="0.04"/>
+    </pattern>
+  </defs>
+
+  <rect width="1440" height="720" rx="34" fill="#F4EFE7"/>
+  <rect width="1440" height="720" rx="34" fill="url(#grain)"/>
+  <path d="M0 548 C280 516 420 628 720 580 C1004 534 1140 440 1440 480 V720 H0Z" fill="#E9DFD2" opacity="0.55"/>
+
+  <g transform="translate(88 82)">
+    <rect width="58" height="58" rx="16" fill="#1E1C1A"/>
+    <path d="M17 27a13 13 0 0 1 22-8M41 31a13 13 0 0 1-22 8" fill="none" stroke="#F7F1E8" stroke-width="4" stroke-linecap="round"/>
+    <path d="m37 14 4 6-7 1M21 44l-4-6 7-1" fill="none" stroke="#C86F4A" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="78" y="25" fill="#1E1C1A" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18" font-weight="700" letter-spacing="0.6">CODEX CIRCUIT RESUMER</text>
+    <text x="78" y="50" fill="#766B62" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="15">本地 · 安静 · 持续守望</text>
+  </g>
+
+  <g transform="translate(88 190)">
+    <text x="0" y="0" fill="#1E1C1A" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="58" font-weight="650" letter-spacing="-2">线路会熔断，</text>
+    <text x="0" y="72" fill="#B65F3E" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="58" font-weight="650" letter-spacing="-2">工作不必。</text>
+    <text x="2" y="127" fill="#665D56" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="21">线路恢复后，接回原对话；多个项目，安全排队继续。</text>
+  </g>
+
+  <g transform="translate(88 450)">
+    <g>
+      <rect width="146" height="44" rx="22" fill="#1E1C1A"/>
+      <circle cx="25" cy="22" r="6" fill="#78A283"/>
+      <text x="42" y="28" fill="#FBF7F0" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="15" font-weight="600">自动续接</text>
+    </g>
+    <g transform="translate(160)">
+      <rect width="146" height="44" rx="22" fill="#E7DDD0"/>
+      <circle cx="25" cy="22" r="6" fill="#C86F4A"/>
+      <text x="42" y="28" fill="#3A332E" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="15" font-weight="600">智能降档</text>
+    </g>
+    <g transform="translate(320)">
+      <rect width="146" height="44" rx="22" fill="#E7DDD0"/>
+      <circle cx="25" cy="22" r="6" fill="#D0A455"/>
+      <text x="42" y="28" fill="#3A332E" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="15" font-weight="600">渠道体检</text>
+    </g>
+  </g>
+
+  <g transform="translate(702 110)" filter="url(#shadow)">
+    <rect width="650" height="500" rx="28" fill="#FEFCF8"/>
+    <rect width="650" height="68" rx="28" fill="#211F1D"/>
+    <path d="M0 40h650v28H0z" fill="#211F1D"/>
+    <circle cx="30" cy="34" r="6" fill="#C86F4A"/>
+    <circle cx="50" cy="34" r="6" fill="#D0A455"/>
+    <circle cx="70" cy="34" r="6" fill="#78A283"/>
+    <text x="104" y="41" fill="#F8F2E9" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="16" font-weight="650">熔断续聊 · 线路控制台</text>
+
+    <g transform="translate(34 98)">
+      <rect width="582" height="100" rx="18" fill="#F4EFE7"/>
+      <g transform="translate(24 20)">
+        <circle cx="30" cy="30" r="25" fill="#DDE9E0"/>
+        <path d="M18 33c7-10 17-10 24 0M22 27c5-6 11-6 16 0M30 20v20" fill="none" stroke="#628D70" stroke-width="3" stroke-linecap="round"/>
+        <text x="70" y="25" fill="#201E1C" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="14" font-weight="700">CC Switch</text>
+        <text x="70" y="47" fill="#776E66" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="12">发现可用线路</text>
+      </g>
+      <path d="M222 50h88" stroke="#6D9A78" stroke-width="3" stroke-linecap="round"/>
+      <path d="m301 42 10 8-10 8" fill="none" stroke="#6D9A78" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      <g transform="translate(330 20)">
+        <circle cx="30" cy="30" r="25" fill="#F1E2D9"/>
+        <path d="M20 30a10 10 0 1 0 10-10" fill="none" stroke="#B65F3E" stroke-width="3" stroke-linecap="round"/>
+        <path d="m27 17 5 4-5 4" fill="none" stroke="#B65F3E" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        <text x="70" y="25" fill="#201E1C" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="14" font-weight="700">恢复保护</text>
+        <text x="70" y="47" fill="#776E66" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="12">稳定后再继续</text>
+      </g>
+    </g>
+
+    <g transform="translate(34 222)">
+      <text x="0" y="18" fill="#5F5750" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="13" font-weight="650">项目恢复队列</text>
+      <text x="500" y="18" fill="#6D9A78" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="12" font-weight="650">守望中</text>
+
+      <g transform="translate(0 38)">
+        <rect width="582" height="60" rx="14" fill="#F8F5EF" stroke="#E9E1D6"/>
+        <circle cx="28" cy="30" r="8" fill="#6D9A78"/>
+        <text x="48" y="27" fill="#24211F" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="14" font-weight="650">项目 A · 原对话继续</text>
+        <text x="48" y="45" fill="#827970" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="11">已恢复原档位</text>
+        <rect x="485" y="19" width="72" height="24" rx="12" fill="#DDE9E0"/>
+        <text x="503" y="35" fill="#52735B" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="11" font-weight="700">已接回</text>
+      </g>
+
+      <g transform="translate(0 108)">
+        <rect width="582" height="60" rx="14" fill="#F8F5EF" stroke="#E9E1D6"/>
+        <circle cx="28" cy="30" r="8" fill="#C86F4A"/>
+        <text x="48" y="27" fill="#24211F" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="14" font-weight="650">项目 B · 自动续接中</text>
+        <text x="48" y="45" fill="#827970" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="11">线路恢复 · 第 2 次尝试</text>
+        <rect x="485" y="19" width="72" height="24" rx="12" fill="#F1E2D9"/>
+        <text x="503" y="35" fill="#A65336" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="11" font-weight="700">进行中</text>
+      </g>
+
+      <g transform="translate(0 178)">
+        <rect width="582" height="60" rx="14" fill="#F8F5EF" stroke="#E9E1D6"/>
+        <circle cx="28" cy="30" r="8" fill="#D0A455"/>
+        <text x="48" y="27" fill="#24211F" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="14" font-weight="650">项目 C · 安全排队</text>
+        <text x="48" y="45" fill="#827970" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="11">等待空闲并发位</text>
+        <rect x="485" y="19" width="72" height="24" rx="12" fill="#EEE6D7"/>
+        <text x="503" y="35" fill="#8B6D35" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC',sans-serif" font-size="11" font-weight="700">排队中</text>
+      </g>
+    </g>
+  </g>
+
+  <text x="90" y="650" fill="#897C72" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="13" letter-spacing="0.3">macOS · Windows · CC Switch · Codex Desktop</text>
+</svg>

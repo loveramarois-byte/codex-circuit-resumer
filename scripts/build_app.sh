@@ -11,6 +11,18 @@ MACOS="$CONTENTS/MacOS"
 ICONSET="$PROJECT_DIR/.build/CodexCircuitResumer.iconset"
 CIRCUIT_BUILD_CACHE="${TMPDIR:-/tmp}/codex-circuit-resumer-build-cache"
 APP_EXECUTABLE="$DESTINATION/Contents/MacOS/CodexCircuitResumer"
+backup_archive=""
+
+restore_backup_on_error() {
+  exit_code=$?
+  if (( exit_code != 0 )) && [[ -n "$backup_archive" && -f "$backup_archive" ]]; then
+    rm -rf "$DESTINATION"
+    /usr/bin/ditto -x -k "$backup_archive" "${DESTINATION:h}" >/dev/null 2>&1 || true
+  fi
+  exit "$exit_code"
+}
+
+trap restore_backup_on_error EXIT
 
 app_is_running() {
   /bin/ps -axo command= | /usr/bin/awk -v target="$APP_EXECUTABLE" '
@@ -28,8 +40,19 @@ mkdir -p "${DESTINATION:h}"
 mkdir -p "$CIRCUIT_BUILD_CACHE"
 export CLANG_MODULE_CACHE_PATH="$CIRCUIT_BUILD_CACHE/clang"
 if [[ -e "$DESTINATION" ]]; then
-  safe_old="${DESTINATION}.old.$(date +%Y%m%d-%H%M%S)"
-  mv "$DESTINATION" "$safe_old"
+  backup_dir="${DESTINATION:h}/.codex-circuit-resumer-backups"
+  backup_name="${DESTINATION:t:r}-$(date +%Y%m%d-%H%M%S).zip"
+  mkdir -p "$backup_dir"
+  backup_archive="$backup_dir/$backup_name"
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$DESTINATION" "$backup_archive"
+  rm -rf "$DESTINATION"
+
+  backup_archives=("$backup_dir"/*.zip(N.om))
+  if (( ${#backup_archives[@]} > 3 )); then
+    for archive in "${backup_archives[@]:3}"; do
+      rm -f "$archive"
+    done
+  fi
 fi
 
 mkdir -p "$MACOS" "$RESOURCES" "$ICONSET"
@@ -50,8 +73,8 @@ cat > "$CONTENTS/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Codex 熔断续聊</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>2.7.1</string>
-  <key>CFBundleVersion</key><string>271</string>
+  <key>CFBundleShortVersionString</key><string>2.8.0</string>
+  <key>CFBundleVersion</key><string>280</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -94,4 +117,5 @@ if (( was_running )); then
   /usr/bin/open "$DESTINATION"
 fi
 
+trap - EXIT
 echo "$DESTINATION"

@@ -56,6 +56,25 @@ class TurnStatusTests(unittest.TestCase):
             )
             self.assertEqual(daemon.latest_turn_status(path)["state"], "complete")
 
+    def test_turn_status_keeps_latest_user_message_for_resume_attribution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            write_events(
+                path,
+                [
+                    event("task_started", turn_id="turn-marked", started_at=100),
+                    event("user_message", message="继续\n[Codex熔断续聊:auto-123]"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-marked",
+                        completed_at=110,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+            status = daemon.latest_turn_status(path)
+            self.assertEqual(status["user_message"], "继续\n[Codex熔断续聊:auto-123]")
+
     def test_windows_npm_codex_shim_uses_cmd_wrapper(self):
         with mock.patch.object(daemon, "IS_WINDOWS", True), mock.patch.dict(
             os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}
@@ -1270,6 +1289,177 @@ class ReliabilityTests(unittest.TestCase):
             self.assertNotIn(self.thread_id, watcher.state["reasoning_last_capacity_at"])
             self.assertIn(self.thread_id, watcher.state["reasoning_restore_pending"])
 
+    def test_auto_resume_success_requires_matching_launch_marker(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            marker = "auto-marker-123"
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-auto", started_at=now - 2),
+                    event("user_message", message="继续\n[Codex熔断续聊:{}]".format(marker)),
+                    event("task_complete", turn_id="turn-auto", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            item = self.queue_item(root, rollout, turn_id="turn-failed")
+            item["resume_marker"] = marker
+            watcher.state["inflight"] = {self.thread_id: dict(item)}
+
+            watcher.finish_inflight(item, 0, now)
+
+            self.assertEqual(watcher.state["resume_success_count"], 1)
+            self.assertEqual(watcher.state["manual_recovery_count"], 0)
+            self.assertIn("自动续接成功", watcher.state["last_event"])
+
+    def test_manual_continue_is_not_counted_as_auto_resume_success(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-manual", started_at=now - 2),
+                    event("user_message", message="继续"),
+                    event("task_complete", turn_id="turn-manual", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            item = self.queue_item(root, rollout, turn_id="turn-failed")
+            item["resume_marker"] = "different-auto-marker"
+            watcher.state["inflight"] = {self.thread_id: dict(item)}
+
+            watcher.finish_inflight(item, 0, now)
+
+            self.assertEqual(watcher.state["resume_success_count"], 0)
+            self.assertEqual(watcher.state["manual_recovery_count"], 1)
+            self.assertIn("手动继续后完成", watcher.state["last_event"])
+
+    def test_gateway_success_expedites_retry_without_server_hint(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            now = int(time.time())
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"retry_recovery_probe_seconds": 15, "retry_recovery_grace_seconds": 20})
+            watcher = daemon.Watcher(config)
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-wake",
+                    "title": "恢复唤醒",
+                    "detected_at": now - 100,
+                    "not_before": now + 900,
+                    "server_hint_seconds": None,
+                }
+            ]
+            with mock.patch.object(daemon, "latest_success_after", return_value=now - 1):
+                self.assertTrue(watcher.expedite_retries_after_recovery(now))
+            self.assertEqual(watcher.state["scheduled_retries"][0]["not_before"], now + 20)
+            self.assertIn("线路已恢复", watcher.state["last_event"])
+
+    def test_gateway_success_preserves_explicit_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            now = int(time.time())
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-hint",
+                    "title": "遵守上游等待",
+                    "detected_at": now - 100,
+                    "not_before": now + 900,
+                    "server_hint_seconds": 900,
+                }
+            ]
+            with mock.patch.object(daemon, "latest_success_after", return_value=now - 1):
+                self.assertFalse(watcher.expedite_retries_after_recovery(now))
+            self.assertEqual(watcher.state["scheduled_retries"][0]["not_before"], now + 900)
+
+    def test_gateway_success_only_expedites_failures_older_than_success(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            now = int(time.time())
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-before-success",
+                    "title": "旧故障",
+                    "detected_at": now - 100,
+                    "not_before": now + 900,
+                    "server_hint_seconds": None,
+                },
+                {
+                    "thread_id": "019aaaab-bbbb-7ccc-8ddd-eeeeeeeeeeee",
+                    "turn_id": "turn-after-success",
+                    "title": "新故障",
+                    "detected_at": now - 10,
+                    "not_before": now + 900,
+                    "server_hint_seconds": None,
+                },
+            ]
+
+            with mock.patch.object(daemon, "latest_success_after", return_value=now - 50):
+                self.assertTrue(watcher.expedite_retries_after_recovery(now))
+
+            old_failure, new_failure = watcher.state["scheduled_retries"]
+            self.assertEqual(old_failure["not_before"], now + 20)
+            self.assertEqual(old_failure["recovery_detected_at"], now - 50)
+            self.assertEqual(new_failure["not_before"], now + 900)
+            self.assertNotIn("recovery_detected_at", new_failure)
+
+    def test_due_retry_records_manual_completion_instead_of_auto_success(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-manual", started_at=now - 2),
+                    event("user_message", message="继续"),
+                    event("task_complete", turn_id="turn-manual", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["scheduled_retries"] = [
+                {
+                    **self.queue_item(root, rollout, turn_id="turn-failed"),
+                    "not_before": now,
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual(watcher.state["scheduled_retries"], [])
+            self.assertEqual(watcher.state["manual_recovery_count"], 1)
+            self.assertIn("你手动继续后完成", watcher.state["last_event"])
+
+    def test_launch_queue_records_manual_completion_before_starting_cli(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-manual", started_at=now - 2),
+                    event("user_message", message="继续"),
+                    event("task_complete", turn_id="turn-manual", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"notify": False, "codex_proxy_route_repair_enabled": False})
+            watcher = daemon.Watcher(config)
+            watcher.state["phase"] = "resuming"
+            watcher.state["queue"] = [self.queue_item(root, rollout, turn_id="turn-failed")]
+            with mock.patch.object(daemon.subprocess, "Popen") as popen:
+                watcher.launch_next(now)
+            popen.assert_not_called()
+            self.assertEqual(watcher.state["manual_recovery_count"], 1)
+            self.assertIn("你手动继续后完成", watcher.state["last_event"])
+
     def test_dry_run_never_updates_desktop_reasoning(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             config = dict(daemon.DEFAULT_CONFIG)
@@ -1297,6 +1487,23 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(restored["queue"], state["queue"])
             self.assertGreater(restored["state_recovered_at"], 0)
             self.assertIn("安全备份", restored["last_event"])
+
+    def test_upgrade_separates_legacy_launch_count_from_precise_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            daemon.ensure_dirs()
+            legacy = daemon.initial_state()
+            legacy.pop("resume_metrics_started_at")
+            legacy.pop("legacy_resume_count")
+            legacy["resume_count"] = 19
+            daemon.atomic_write_json(daemon.STATE_PATH, legacy)
+
+            restored = daemon.load_state()
+
+            self.assertEqual(restored["legacy_resume_count"], 19)
+            self.assertEqual(restored["resume_count"], 0)
+            self.assertEqual(restored["resume_success_count"], 0)
+            self.assertEqual(restored["manual_recovery_count"], 0)
+            self.assertGreater(restored["resume_metrics_started_at"], 0)
 
     def test_gateway_retry_temporarily_bypasses_p1_without_reordering(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):

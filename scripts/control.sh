@@ -83,6 +83,10 @@ if old_version < 7:
 if old_version < 8:
     current["capacity_reasoning_desktop_sync_enabled"] = bool(current.get("capacity_reasoning_desktop_sync_enabled", True))
     current["config_schema_version"] = 8
+if old_version < 9:
+    current["retry_recovery_probe_seconds"] = int(current.get("retry_recovery_probe_seconds") or 15)
+    current["retry_recovery_grace_seconds"] = int(current.get("retry_recovery_grace_seconds") or 20)
+    current["config_schema_version"] = 9
 merged = dict(defaults)
 merged.update(current)
 config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,13 +186,16 @@ if scheduled is None:
     scheduled = len(s.get("scheduled_retries") or [])
 heartbeat_age = s.get("heartbeat_age_seconds")
 heartbeat = "健康" if s.get("healthy") else "无心跳或需检查"
-print("状态：{}\n后台健康：{}{}\n最后事件：{}\n事件时间：{}\n累计自动续接：{}\n正在续接：{}\n待重试任务：{}\n需人工处理：{}".format(
+print("状态：{}\n后台健康：{}{}\n最后事件：{}\n事件时间：{}\n新版自动发起：{}\n自动成功：{}\n你手动接回：{}\n旧版发起历史：{}（未区分最终结果）\n正在续接：{}\n待重试任务：{}\n需人工处理：{}".format(
     phase_names.get(s.get("phase"), s.get("phase", "未知")),
     heartbeat,
     "（{} 秒前）".format(heartbeat_age) if heartbeat_age is not None else "",
     s.get("last_event", "无"),
     when,
     s.get("resume_count", 0),
+    s.get("resume_success_count", 0),
+    s.get("manual_recovery_count", 0),
+    s.get("legacy_resume_count", 0),
     s.get("inflight_count", len(s.get("inflight") or {})),
     scheduled,
     s.get("blocked_count", len(s.get("blocked") or {})),

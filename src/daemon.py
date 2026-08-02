@@ -41,6 +41,8 @@ LOG_PATH = APP_HOME / "logs" / "watcher.log"
 RUN_LOG_DIR = APP_HOME / "logs" / "runs"
 PROVIDERS_PATH = APP_HOME / "providers.json"
 EXCHANGE_RATE_CACHE_PATH = APP_HOME / "exchange-rate.json"
+APP_VERSION = "2.8.0"
+USER_AGENT = "CodexCircuitResumer/{}".format(APP_VERSION)
 
 
 @contextmanager
@@ -53,7 +55,7 @@ def sqlite_connection(*args, **kwargs):
         connection.close()
 
 DEFAULT_CONFIG = {
-    "config_schema_version": 8,
+    "config_schema_version": 9,
     "cc_switch_log": str(Path.home() / ".cc-switch" / "logs" / "cc-switch.log"),
     "cc_switch_db": str(Path.home() / ".cc-switch" / "cc-switch.db"),
     "codex_state_db": str(Path.home() / ".codex" / "state_5.sqlite"),
@@ -86,6 +88,8 @@ DEFAULT_CONFIG = {
     "model_retry_server_hint_max_seconds": 3600,
     "model_retry_max_attempts": 50,
     "model_retry_watch_hours": 24,
+    "retry_recovery_probe_seconds": 15,
+    "retry_recovery_grace_seconds": 20,
     "capacity_reasoning_fallback_enabled": True,
     "capacity_reasoning_minimum": "low",
     "capacity_reasoning_promote_enabled": True,
@@ -218,8 +222,15 @@ def initial_state():
         "last_event": "等待 CC Switch 熔断事件",
         "last_event_at": int(time.time()),
         "resume_count": 0,
+        "resume_success_count": 0,
+        "manual_recovery_count": 0,
+        "legacy_resume_count": 0,
+        "resume_metrics_started_at": int(time.time()),
+        "recovery_attributions": {},
         "last_success_at": 0,
         "last_success_title": "",
+        "last_manual_recovery_at": 0,
+        "last_manual_recovery_title": "",
         "scheduled_retries": [],
         "retry_attempts": {},
         "reasoning_efforts": {},
@@ -230,6 +241,7 @@ def initial_state():
         "retry_scan_cursor": None,
         "watch_started_at": int(time.time()),
         "last_retry_scan_at": 0,
+        "last_retry_recovery_check_at": 0,
         "last_error_scan_at": 0,
         "last_provider_snapshot_at": 0,
         "last_balance_probe_at": 0,
@@ -281,8 +293,14 @@ def load_state():
     base = initial_state()
     if state is not None:
         base.update(state)
+        if "resume_metrics_started_at" not in state:
+            base["legacy_resume_count"] = int(state.get("resume_count") or 0)
+            base["resume_count"] = 0
+            base["resume_success_count"] = 0
+            base["manual_recovery_count"] = 0
+            base["resume_metrics_started_at"] = int(time.time())
     base["version"] = 2
-    for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "reasoning_restore_pending", "reasoning_restore_last_scan", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures"):
+    for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "reasoning_restore_pending", "reasoning_restore_last_scan", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures", "recovery_attributions"):
         if not isinstance(base.get(key), dict):
             base[key] = {}
     for key in ("queue", "candidate_backlog", "scheduled_retries", "temporary_failover_bypasses"):
@@ -899,7 +917,7 @@ def update_thread_reasoning_effort(config, thread_id, effort):
             1,
             "initialize",
             {
-                "clientInfo": {"name": "codex-circuit-resumer", "version": "2.7.1"},
+                "clientInfo": {"name": "codex-circuit-resumer", "version": APP_VERSION},
                 "capabilities": {"experimentalApi": True},
             },
         )
@@ -1125,11 +1143,28 @@ def latest_turn_status(path):
             "error": None,
             "started_at": None,
             "completed_at": None,
+            "user_message": None,
         }
 
     complete = None
+    user_message = None
     for event in events[start_index + 1 :]:
         payload = event.get("payload") or {}
+        if event.get("type") == "event_msg" and payload.get("type") == "user_message":
+            message = payload.get("message")
+            if isinstance(message, str):
+                user_message = message
+        elif (
+            event.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            parts = []
+            for content in payload.get("content") or []:
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    parts.append(content["text"])
+            if parts:
+                user_message = "".join(parts)
         if event.get("type") == "event_msg" and payload.get("type") == "task_complete":
             complete = payload
 
@@ -1147,6 +1182,7 @@ def latest_turn_status(path):
             "error": None,
             "started_at": as_epoch((started or {}).get("started_at"), file_mtime),
             "completed_at": None,
+            "user_message": user_message,
         }
 
     final_message = complete.get("last_agent_message")
@@ -1160,6 +1196,7 @@ def latest_turn_status(path):
             "error": None,
             "started_at": started_at,
             "completed_at": completed_at,
+            "user_message": user_message,
         }
     if error:
         error_text = json.dumps(error, ensure_ascii=False).lower()
@@ -1170,6 +1207,7 @@ def latest_turn_status(path):
             "error": error,
             "started_at": started_at,
             "completed_at": completed_at,
+            "user_message": user_message,
         }
     return {
         "state": "interrupted",
@@ -1177,6 +1215,7 @@ def latest_turn_status(path):
         "error": None,
         "started_at": started_at,
         "completed_at": completed_at,
+        "user_message": user_message,
     }
 
 
@@ -1275,7 +1314,7 @@ def query_usd_cny_rate(timeout=5):
     )
     for endpoint, extract in endpoints:
         try:
-            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "CodexCircuitResumer/2.6.0"})
+            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
             with urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             rate = extract(payload)
@@ -1396,7 +1435,7 @@ def query_sub2api_billing(base_url, api_key, timeout=8):
         headers={
             "Authorization": "Bearer " + api_key,
             "Accept": "application/json",
-            "User-Agent": "CodexCircuitResumer/2.6.0",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
@@ -2312,6 +2351,37 @@ class Watcher:
             notify("Codex 熔断续聊", "{}：{}".format(reason, item.get("title") or thread_id))
         return True
 
+    def record_completed_recovery(self, item, current, now):
+        if current.get("state") != "complete":
+            return None
+        completed_turn_id = current.get("turn_id")
+        if not completed_turn_id:
+            return None
+        attributed = self.state.setdefault("recovery_attributions", {})
+        existing = attributed.get(completed_turn_id)
+        if existing:
+            return existing.get("kind")
+        marker = str(item.get("resume_marker") or "")
+        marker_text = "[Codex熔断续聊:{}]".format(marker) if marker else ""
+        kind = "auto" if marker_text and marker_text in str(current.get("user_message") or "") else "manual"
+        attributed[completed_turn_id] = {
+            "kind": kind,
+            "thread_id": item.get("thread_id"),
+            "recorded_at": now,
+        }
+        title = item.get("title") or item.get("thread_id")
+        if kind == "auto":
+            self.state["resume_success_count"] = int(self.state.get("resume_success_count", 0)) + 1
+            self.state["last_success_at"] = now
+            self.state["last_success_title"] = title
+            self.set_event("自动续接成功：{} ({})".format(title, item.get("thread_id")), now)
+        else:
+            self.state["manual_recovery_count"] = int(self.state.get("manual_recovery_count", 0)) + 1
+            self.state["last_manual_recovery_at"] = now
+            self.state["last_manual_recovery_title"] = title
+            self.set_event("检测到你手动继续后完成：{} ({})".format(title, item.get("thread_id")), now)
+        return kind
+
     def finish_inflight(self, item, result, now):
         thread_id = item.get("thread_id")
         turn_id = item.get("turn_id")
@@ -2331,9 +2401,7 @@ class Watcher:
             self.state.setdefault("launcher_failures", {}).pop(thread_id, None)
             self.state.setdefault("blocked", {}).pop(thread_id, None)
             self.clear_reasoning_state(thread_id)
-            self.state["last_success_at"] = now
-            self.state["last_success_title"] = item.get("title") or thread_id
-            self.set_event("续接成功完成：{} ({})".format(item.get("title"), thread_id), now)
+            self.record_completed_recovery(item, current, now)
             return
 
         if current.get("turn_id") != turn_id:
@@ -2420,6 +2488,37 @@ class Watcher:
         if success_at:
             self.handle_closed(success_at, "由 CC Switch 成功请求确认线路恢复")
 
+    def expedite_retries_after_recovery(self, now):
+        scheduled = self.state.get("scheduled_retries") or []
+        if not scheduled:
+            return False
+        interval = max(5, int(self.config.get("retry_recovery_probe_seconds", 15)))
+        last_check = int(self.state.get("last_retry_recovery_check_at") or 0)
+        if now - last_check < interval:
+            return False
+        self.state["last_retry_recovery_check_at"] = now
+        detected = [int(item.get("detected_at") or 0) for item in scheduled if item.get("detected_at")]
+        if not detected:
+            return False
+        success_at = latest_success_after(self.config, min(detected))
+        if not success_at:
+            return False
+        grace = max(5, int(self.config.get("retry_recovery_grace_seconds", 20)))
+        wake_at = now + grace
+        changed = False
+        for item in scheduled:
+            if item.get("server_hint_seconds"):
+                continue
+            if success_at < int(item.get("detected_at") or 0):
+                continue
+            if int(item.get("not_before") or 0) > wake_at:
+                item["not_before"] = wake_at
+                item["recovery_detected_at"] = success_at
+                changed = True
+        if changed:
+            self.set_event("检测到线路已恢复，待重试任务将在 {} 秒保护期后提前继续".format(grace), now)
+        return changed
+
     def maintenance(self, now):
         last_cleanup = int(self.state.get("last_cleanup_at") or 0)
         if now - last_cleanup < 3600:
@@ -2434,6 +2533,10 @@ class Watcher:
         for thread_id, item in list(blocked.items()):
             if int(item.get("blocked_at") or 0) < cutoff:
                 blocked.pop(thread_id, None)
+        attributed = self.state.setdefault("recovery_attributions", {})
+        for turn_id, item in list(attributed.items()):
+            if int(item.get("recorded_at") or 0) < cutoff:
+                attributed.pop(turn_id, None)
         cleanup_run_logs(self.config, now)
 
     def handle_open(self, when, line=""):
@@ -2863,7 +2966,7 @@ class Watcher:
             self.state.setdefault("reasoning_efforts", {}).pop(item.get("thread_id"), None)
             self.state.setdefault("reasoning_originals", {}).pop(item.get("thread_id"), None)
             self.state.setdefault("reasoning_last_capacity_at", {}).pop(item.get("thread_id"), None)
-            self.set_event("任务已自行完成，取消无人值守重试：{}".format(item.get("title")), now)
+            self.record_completed_recovery(item, current, now)
             save_state(self.state)
             return
         if current.get("turn_id") != item.get("turn_id"):
@@ -3007,7 +3110,10 @@ class Watcher:
             # Do not discard reasoning_restore_pending here. A user may have
             # continued the failed high-effort turn manually at medium; the
             # idle Desktop sync still needs to restore the original tier.
-            self.set_event("跳过已被手动恢复的任务：{}".format(item["title"]), now)
+            if current.get("state") == "complete":
+                self.record_completed_recovery(item, current, now)
+            else:
+                self.set_event("跳过已被手动恢复的任务：{}".format(item["title"]), now)
             save_state(self.state)
             return
 
@@ -3036,6 +3142,9 @@ class Watcher:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         run_log = RUN_LOG_DIR / "{}-{}.log".format(timestamp, item["thread_id"])
         launch_item = dict(item)
+        resume_marker = "{}-{}-{:08x}".format(
+            item["thread_id"][-8:], now, random.getrandbits(32)
+        )
         launch_item.update(
             {
                 "status": "launching",
@@ -3044,6 +3153,7 @@ class Watcher:
                 "run_log": str(run_log),
                 "exit_code": None,
                 "exited_at": None,
+                "resume_marker": resume_marker,
             }
         )
         inflight[item["thread_id"]] = launch_item
@@ -3063,7 +3173,7 @@ class Watcher:
         command.extend([
             "resume",
             item["thread_id"],
-            self.config["resume_prompt"],
+            "{}\n\n[Codex熔断续聊:{}]".format(self.config["resume_prompt"], resume_marker),
         ])
         child_env = os.environ.copy()
         path_parts = list(self.config.get("extra_path", []))
@@ -3119,7 +3229,7 @@ class Watcher:
             "log_handle": log_handle,
             **launch_item,
         }
-        self.set_event("已自动续接：{} ({})".format(item["title"], item["thread_id"]), now)
+        self.set_event("已发起自动续接，等待确认结果：{} ({})".format(item["title"], item["thread_id"]), now)
         if self.config.get("notify"):
             notify("Codex 熔断续聊", "线路恢复，已续接：{}".format(item["title"]))
         save_state(self.state)
@@ -3139,13 +3249,14 @@ class Watcher:
         self.reconcile_inflight(now)
         self.reconcile_circuit(now)
         self.discover_retryable_failures(now)
+        recovery_changed = self.expedite_retries_after_recovery(now)
         self.refresh_provider_snapshot(now)
         restore_changed = self.restore_due_desktop_reasoning(now)
         self.prepare_queue_if_ready(now)
         self.promote_due_retries(now)
         self.launch_next(now)
         self.maintenance(now)
-        if restore_changed:
+        if restore_changed or recovery_changed:
             save_state(self.state)
         self.state["heartbeat_at"] = int(time.time())
         self.state["last_tick_duration_ms"] = int((time.monotonic() - started) * 1000)

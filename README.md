@@ -1,12 +1,31 @@
 # Codex Circuit Resumer / Codex 熔断续聊
 
-[![CI](https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml/badge.svg)](https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![macOS 13+](https://img.shields.io/badge/macOS-13%2B-black?logo=apple)](#环境要求)
-[![Windows 10/11](https://img.shields.io/badge/Windows-10%2F11-blue?logo=windows)](#环境要求)
-[![Release](https://img.shields.io/badge/release-2.7.1-blue)](CHANGELOG.md)
+<p align="center">
+  <img src="assets/readme-hero.svg" alt="Codex 熔断续聊：线路恢复后自动接回多个中断项目" width="100%">
+</p>
 
-一个面向 macOS、Windows、CC Switch 与 Codex Desktop 的本地守望工具。它监控中转线路熔断、模型池满载和临时网关故障，在条件恢复后继续原 Codex 对话，并提供渠道健康、真实倍率、人民币费用及 Claude Desktop 渠道状态总览。
+<p align="center">
+  <strong>线路会熔断，工作不必。</strong><br>
+  <sub>留在本机的安静守望器：线路恢复后，回到原对话，把未完成的工作继续下去。</sub>
+</p>
+
+<p align="center">
+  <a href="https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml"><img src="https://github.com/loveramarois-byte/codex-circuit-resumer/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-6F8F78.svg" alt="MIT License"></a>
+  <img src="https://img.shields.io/badge/macOS-13%2B-171717?logo=apple" alt="macOS 13+">
+  <img src="https://img.shields.io/badge/Windows-10%2F11-C76545?logo=windows" alt="Windows 10/11">
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/release-2.8.0-C76545" alt="Release 2.8.0"></a>
+</p>
+
+它不替代 CC Switch，也不接管你的工作方式。它只在本地守着中转线路和 Codex 对话：模型满载时逐档降低推理强度，API 恢复时回到原 thread；同时运行多个项目时，前两个并发续接，其余安全排队。
+
+| 当你不在电脑前 | 它会怎么做 |
+| --- | --- |
+| 所有 API 熔断 | 记录受影响的原对话，安静等待，不制造重复任务 |
+| 两小时后有线路恢复 | 发现成功请求，经过 20 秒恢复保护后提前唤醒重试 |
+| 同时跑多个项目 | 默认并发续接 2 个，其余进入持久队列，逐批继续 |
+| 模型档位满载 | 按“极高 → 高 → 中 → 低”降档，可用后再回到原档位 |
+| 你已经手动点了继续 | 识别为“你手动接回”，不会冒充软件自动成功 |
 
 > 这是社区维护的非官方项目，与 OpenAI、Codex 或 CC Switch 官方无隶属关系。
 
@@ -30,6 +49,8 @@ Codex Circuit Resumer 将这些情况收敛成一个轻量的本地后台守望�
 - 扫描 Codex rollout 中的模型满载、限流、503、超时和余额不足等可重试错误；
 - 使用指数退避、随机错峰和上游 `Retry-After`，避免反复冲击低速渠道；
 - 成功、人工继续或出现登录/审批等不可自动处理问题时及时收队；
+- 严格区分“自动续接已发起”“自动续接已成功”和“你手动接回”，不再把手动点击算成软件成功；
+- CC Switch 恢复成功请求后提前唤醒长退避任务，同时继续遵守上游明确给出的 `Retry-After`；
 - 保留原 thread，不新建重复对话。
 
 ### 模型满载自动降档与恢复
@@ -215,6 +236,8 @@ Windows CI 在 GitHub 官方 `windows-latest` 虚拟机上执行 Python 回归�
 Council Lab 认可并感谢 [LINUX DO](https://linux.do/) 社区及佬友们对开源交流、软件开发和项目成长提供的支持。
 
 重试与守护设计参考了 [Tenacity](https://github.com/jd/tenacity)、[pybreaker](https://github.com/danielfm/pybreaker)、[Uptime Kuma](https://github.com/louislam/uptime-kuma)、[Healthchecks](https://github.com/healthchecks/healthchecks) 和 [Supervisor](https://github.com/Supervisor/supervisor) 的公开工程实践。
+
+本轮还对比了直接同类项目 [codex-retry-gateway](https://github.com/nonononull/codex-retry-gateway) 与 [codex-runner](https://github.com/Draivix/codex-runner)，以及 LiteLLM 的 fallback/cooldown 思路。吸收的是“启动与成功分账、健康恢复后提前唤醒、共享退避预算”这些机制；本项目仍保持单后台进程、零额外网关、低内存的小而美结构。参考仓库未声明许可证的源码没有复制。
 
 ## 许可证
 

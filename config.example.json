@@ -1,5 +1,5 @@
 {
-  "config_schema_version": 8,
+  "config_schema_version": 9,
   "codex_state_db": "~/.codex/state_5.sqlite",
   "recovery_grace_seconds": 20,
   "active_thread_idle_seconds": 240,
@@ -22,6 +22,8 @@
   "model_retry_server_hint_max_seconds": 3600,
   "model_retry_max_attempts": 50,
   "model_retry_watch_hours": 24,
+  "retry_recovery_probe_seconds": 15,
+  "retry_recovery_grace_seconds": 20,
   "capacity_reasoning_fallback_enabled": true,
   "capacity_reasoning_minimum": "low",
   "capacity_reasoning_promote_enabled": true,

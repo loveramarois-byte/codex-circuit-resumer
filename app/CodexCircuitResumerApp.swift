@@ -323,6 +323,9 @@ private final class AppModel: ObservableObject {
     @Published var lastEvent = "等待 CC Switch 熔断事件"
     @Published var lastEventAt: Int = 0
     @Published var resumeCount = 0
+    @Published var resumeSuccessCount = 0
+    @Published var manualRecoveryCount = 0
+    @Published var legacyResumeCount = 0
     @Published var queueCount = 0
     @Published var isPaused = false
     @Published var isLoaded = false
@@ -487,14 +490,13 @@ private final class AppModel: ObservableObject {
     var healthTitle: String {
         if !isLoaded { return "未运行" }
         if isPaused { return "已暂停" }
-        if blockedCount > 0 { return "需人工处理" }
         if !daemonHealthy { return "后台无响应" }
         return "健康"
     }
 
     var healthColor: Color {
         if !isLoaded || isPaused { return Palette.muted }
-        if blockedCount > 0 || !daemonHealthy { return Palette.danger }
+        if !daemonHealthy { return Palette.danger }
         return Palette.success
     }
 
@@ -583,6 +585,9 @@ private final class AppModel: ObservableObject {
         lastEvent = state["last_event"] as? String ?? "等待 CC Switch 熔断事件"
         lastEventAt = state["last_event_at"] as? Int ?? 0
         resumeCount = state["resume_count"] as? Int ?? 0
+        resumeSuccessCount = state["resume_success_count"] as? Int ?? 0
+        manualRecoveryCount = state["manual_recovery_count"] as? Int ?? 0
+        legacyResumeCount = state["legacy_resume_count"] as? Int ?? 0
         let activeQueueCount = (state["queue"] as? [[String: Any]])?.count ?? 0
         let backlogCount = (state["candidate_backlog"] as? [[String: Any]])?.count ?? 0
         queueCount = activeQueueCount + backlogCount
@@ -1241,7 +1246,8 @@ private struct MetricsView: View {
     var body: some View {
         HStack(spacing: 10) {
             MetricCell(label: "后台健康", value: model.healthTitle, color: model.healthColor, compact: true)
-            MetricCell(label: "正在续接", value: "\(model.inflightCount)", color: model.inflightCount > 0 ? Palette.accent : Palette.ink)
+            MetricCell(label: "自动成功", value: "\(model.resumeSuccessCount)", color: model.resumeSuccessCount > 0 ? Palette.success : Palette.ink, detail: "新版已发起 \(model.resumeCount) 次")
+            MetricCell(label: "你手动接回", value: "\(model.manualRecoveryCount)", color: model.manualRecoveryCount > 0 ? Palette.warning : Palette.ink)
             MetricCell(label: "待处理队列", value: "\(model.queueCount + model.scheduledRetryCount + model.reasoningRestorePendingCount)", color: model.queueCount + model.scheduledRetryCount + model.reasoningRestorePendingCount > 0 ? Palette.warning : Palette.ink)
             MetricCell(label: "需人工处理", value: "\(model.blockedCount)", color: model.blockedCount > 0 ? Palette.danger : Palette.ink)
         }
