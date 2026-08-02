@@ -202,6 +202,31 @@ class TurnStatusTests(unittest.TestCase):
         )
 
 
+class ConfigMigrationTests(unittest.TestCase):
+    def test_upgrade_changes_former_parallel_default_and_persists_it(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            daemon.ensure_dirs()
+            daemon.atomic_write_json(
+                daemon.CONFIG_PATH,
+                {"config_schema_version": 8, "max_parallel_resumes": 1},
+            )
+
+            config = daemon.load_config()
+            persisted = json.loads(daemon.CONFIG_PATH.read_text(encoding="utf-8"))
+
+            self.assertEqual(config["max_parallel_resumes"], 2)
+            self.assertEqual(persisted["max_parallel_resumes"], 2)
+            self.assertEqual(persisted["config_schema_version"], 9)
+
+    def test_upgrade_preserves_custom_parallel_limit(self):
+        migrated = daemon.migrate_user_config(
+            {"config_schema_version": 8, "max_parallel_resumes": 4}
+        )
+
+        self.assertEqual(migrated["max_parallel_resumes"], 4)
+        self.assertEqual(migrated["config_schema_version"], 9)
+
+
 class DetectionTests(unittest.TestCase):
     def test_transition_parser(self):
         opened = "[2026-07-31][11:24:08][WARN] 熔断器 Closed → Open"
@@ -1683,13 +1708,18 @@ class ReliabilityTests(unittest.TestCase):
             watcher = daemon.Watcher(config)
             item = self.queue_item(root, rollout, turn_id="turn-gateway-launch")
             item["gateway_failover_bypass"] = True
+            waiting_item = {
+                **item,
+                "thread_id": "019fb64d-d041-7842-adbf-01b165ad1b99",
+                "title": "后续排队任务",
+            }
             watcher.state["phase"] = "resuming"
-            watcher.state["queue"] = [item]
+            watcher.state["queue"] = [item, waiting_item]
             with mock.patch.object(daemon.subprocess, "Popen", side_effect=OSError("temporary spawn failure")):
                 watcher.launch_next(int(time.time()))
             with daemon.sqlite_connection(str(cc_db)) as db:
                 self.assertEqual(db.execute("SELECT in_failover_queue FROM providers WHERE id='p1'").fetchone()[0], 1)
-            self.assertEqual(watcher.state["queue"], [])
+            self.assertEqual(watcher.state["queue"], [waiting_item])
             self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
 
     def test_popen_failure_does_not_permanently_deduplicate(self):

@@ -84,6 +84,8 @@ if old_version < 8:
     current["capacity_reasoning_desktop_sync_enabled"] = bool(current.get("capacity_reasoning_desktop_sync_enabled", True))
     current["config_schema_version"] = 8
 if old_version < 9:
+    if current.get("max_parallel_resumes", 1) == 1:
+        current["max_parallel_resumes"] = 2
     current["retry_recovery_probe_seconds"] = int(current.get("retry_recovery_probe_seconds") or 15)
     current["retry_recovery_grace_seconds"] = int(current.get("retry_recovery_grace_seconds") or 20)
     current["config_schema_version"] = 9

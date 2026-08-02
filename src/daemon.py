@@ -195,13 +195,38 @@ def setup_logging():
     )
 
 
+def migrate_user_config(user_config):
+    current = dict(user_config)
+    try:
+        old_version = max(1, int(current.get("config_schema_version") or 1))
+    except (TypeError, ValueError, OverflowError):
+        old_version = 1
+    if old_version < 9:
+        if current.get("max_parallel_resumes", 1) == 1:
+            current["max_parallel_resumes"] = 2
+        current["retry_recovery_probe_seconds"] = nonnegative_int(
+            current.get("retry_recovery_probe_seconds"), 15
+        ) or 15
+        current["retry_recovery_grace_seconds"] = nonnegative_int(
+            current.get("retry_recovery_grace_seconds"), 20
+        ) or 20
+        current["config_schema_version"] = 9
+    return current
+
+
 def load_config():
     config = dict(DEFAULT_CONFIG)
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             user_config = json.load(handle)
         if isinstance(user_config, dict):
-            config.update(user_config)
+            migrated = migrate_user_config(user_config)
+            config.update(migrated)
+            if migrated != user_config:
+                ensure_dirs()
+                atomic_write_json(CONFIG_PATH, migrated)
+                if not IS_WINDOWS:
+                    CONFIG_PATH.chmod(0o600)
     except FileNotFoundError:
         pass
     except Exception as exc:
@@ -3116,6 +3141,7 @@ class Watcher:
             self.state["proxy_route_retry_at"] = 0
 
         item = queue.pop(0)
+        remaining_queue = list(queue)
         current = latest_turn_status(Path(item["rollout_path"]))
         if current.get("turn_id") != item["turn_id"] or current.get("state") == "complete":
             self.state.setdefault("reasoning_efforts", {}).pop(item.get("thread_id"), None)
@@ -3140,7 +3166,7 @@ class Watcher:
         if item.get("gateway_failover_bypass"):
             # Persist the popped item before the bypass mutation.  A crash in
             # the tiny window before Popen must replay the task, not lose it.
-            self.state["queue"] = [item]
+            self.state["queue"] = [item] + remaining_queue
             save_state(self.state)
             bypass = temporarily_bypass_first_codex_provider(
                 self.config,
@@ -3151,7 +3177,7 @@ class Watcher:
             if bypass:
                 item["temporary_bypass_provider_id"] = bypass.get("provider_id")
                 item["temporary_bypass_provider_name"] = bypass.get("provider_name")
-            self.state["queue"] = []
+            self.state["queue"] = remaining_queue
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         run_log = RUN_LOG_DIR / "{}-{}.log".format(timestamp, item["thread_id"])
@@ -3208,7 +3234,7 @@ class Watcher:
             if log_handle is not None:
                 log_handle.close()
             inflight.pop(item["thread_id"], None)
-            self.state["queue"] = []
+            self.state["queue"] = remaining_queue
             if bypass:
                 restore_temporary_failover_bypasses(
                     self.config, self.state, provider_id=bypass.get("provider_id"), now=now

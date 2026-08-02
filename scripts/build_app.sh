@@ -12,12 +12,17 @@ ICONSET="$PROJECT_DIR/.build/CodexCircuitResumer.iconset"
 CIRCUIT_BUILD_CACHE="${TMPDIR:-/tmp}/codex-circuit-resumer-build-cache"
 APP_EXECUTABLE="$DESTINATION/Contents/MacOS/CodexCircuitResumer"
 backup_archive=""
+backup_temp=""
+backup_ready=0
 
 restore_backup_on_error() {
   exit_code=$?
-  if (( exit_code != 0 )) && [[ -n "$backup_archive" && -f "$backup_archive" ]]; then
+  if (( exit_code != 0 && backup_ready )) && [[ -n "$backup_archive" && -f "$backup_archive" ]]; then
     rm -rf "$DESTINATION"
     /usr/bin/ditto -x -k "$backup_archive" "${DESTINATION:h}" >/dev/null 2>&1 || true
+  fi
+  if (( exit_code != 0 )) && [[ -n "$backup_temp" && -f "$backup_temp" ]]; then
+    rm -f "$backup_temp"
   fi
   exit "$exit_code"
 }
@@ -44,7 +49,11 @@ if [[ -e "$DESTINATION" ]]; then
   backup_name="${DESTINATION:t:r}-$(date +%Y%m%d-%H%M%S).zip"
   mkdir -p "$backup_dir"
   backup_archive="$backup_dir/$backup_name"
-  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$DESTINATION" "$backup_archive"
+  backup_temp="${backup_archive}.partial.$$"
+  /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$DESTINATION" "$backup_temp"
+  mv "$backup_temp" "$backup_archive"
+  backup_temp=""
+  backup_ready=1
   rm -rf "$DESTINATION"
 
   backup_archives=("$backup_dir"/*.zip(N.om))
