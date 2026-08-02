@@ -4,6 +4,47 @@ All notable changes to this project are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and releases use semantic versioning where practical.
 
+## [2.8.0] - 2026-08-02
+
+### Added
+
+- Track auto-resume launches, confirmed auto-resume successes, and manual recoveries separately.
+- Add a per-launch attribution marker so a user's manual Continue action is never credited as an automatic success.
+- Expedite pending retries after CC Switch records a successful Codex request, while preserving explicit upstream `Retry-After` delays.
+
+### Changed
+
+- Show “自动成功 / 已发起” and “你手动接回” as separate macOS and Windows status metrics.
+- Preserve pre-2.8 launch history separately and start the precise attribution counters at zero after upgrade.
+- Rename launch events to “已发起自动续接，等待确认结果” until the resumed turn actually completes.
+- Keep same-turn self-completions separate so they are never reported as a user's manual Continue action.
+- Keep daemon health separate from tasks that need manual login or token repair.
+- Store future macOS app upgrade backups as compressed archives, retain the latest three, and restore the previous app automatically if a build fails.
+- Only wake a pending retry when the observed successful request is newer than that task's failure.
+
+### Verified
+
+- 95 unit tests plus a macOS build-rollback integration test.
+- 50 process-level macOS drills.
+- macOS app build and Windows Python/static syntax checks.
+
+## [2.7.1] - 2026-08-02
+
+### Fixed
+
+- Allow due retries to use a free resume slot while another task is already being resumed.
+- Continue scanning Codex rollout errors during unrelated resume work, so simultaneous capacity/503 failures are not missed.
+- Resume genuinely stalled active turns instead of delaying them forever; active turns that are still writing logs remain protected.
+
+### Changed
+
+- Raise the default unattended resume concurrency from 1 to 2 for low-rate CC Switch failover setups.
+
+### Verified
+
+- 78 unit tests.
+- 50 process-level macOS drills.
+
 ## [2.7.0] - 2026-08-02
 
 ### Added

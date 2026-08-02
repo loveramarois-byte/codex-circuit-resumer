@@ -23,6 +23,7 @@ jobs:
 
       - name: Build macOS app
         run: |
+          tests/test_build_app_rollback.zsh
           ./scripts/build_app.sh "$RUNNER_TEMP/CodexCircuitResumer.app"
           codesign --verify --deep --strict --verbose=2 "$RUNNER_TEMP/CodexCircuitResumer.app"
 

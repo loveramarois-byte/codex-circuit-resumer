@@ -56,6 +56,79 @@ class TurnStatusTests(unittest.TestCase):
             )
             self.assertEqual(daemon.latest_turn_status(path)["state"], "complete")
 
+    def test_turn_status_keeps_latest_user_message_for_resume_attribution(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            write_events(
+                path,
+                [
+                    event("task_started", turn_id="turn-marked", started_at=100),
+                    event("user_message", message="继续\n[Codex熔断续聊:auto-123]"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-marked",
+                        completed_at=110,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+            status = daemon.latest_turn_status(path)
+            self.assertEqual(status["user_message"], "继续\n[Codex熔断续聊:auto-123]")
+
+    def test_turn_status_reads_response_item_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            write_events(
+                path,
+                [
+                    event("task_started", turn_id="turn-response-item", started_at=100),
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "继续"},
+                                {"type": "input_text", "text": "\n[Codex熔断续聊:auto-456]"},
+                            ],
+                        },
+                    },
+                    event(
+                        "task_complete",
+                        turn_id="turn-response-item",
+                        completed_at=110,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+
+            status = daemon.latest_turn_status(path)
+
+            self.assertEqual(status["user_message"], "继续\n[Codex熔断续聊:auto-456]")
+
+    def test_turn_status_keeps_auto_marker_before_later_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            write_events(
+                path,
+                [
+                    event("task_started", turn_id="turn-steered", started_at=100),
+                    event("user_message", message="继续\n[Codex熔断续聊:auto-789]"),
+                    event("user_message", message="顺便把测试也跑了"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-steered",
+                        completed_at=110,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+
+            status = daemon.latest_turn_status(path)
+
+            self.assertEqual(status["user_message"], "顺便把测试也跑了")
+            self.assertIn("继续\n[Codex熔断续聊:auto-789]", status["user_messages"])
+
     def test_windows_npm_codex_shim_uses_cmd_wrapper(self):
         with mock.patch.object(daemon, "IS_WINDOWS", True), mock.patch.dict(
             os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}
@@ -150,6 +223,31 @@ class TurnStatusTests(unittest.TestCase):
         self.assertFalse(
             daemon.retryable_gateway_error('{"code":"bad_request","message":"invalid request body"}')
         )
+
+
+class ConfigMigrationTests(unittest.TestCase):
+    def test_upgrade_changes_former_parallel_default_and_persists_it(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            daemon.ensure_dirs()
+            daemon.atomic_write_json(
+                daemon.CONFIG_PATH,
+                {"config_schema_version": 8, "max_parallel_resumes": 1},
+            )
+
+            config = daemon.load_config()
+            persisted = json.loads(daemon.CONFIG_PATH.read_text(encoding="utf-8"))
+
+            self.assertEqual(config["max_parallel_resumes"], 2)
+            self.assertEqual(persisted["max_parallel_resumes"], 2)
+            self.assertEqual(persisted["config_schema_version"], 9)
+
+    def test_upgrade_preserves_custom_parallel_limit(self):
+        migrated = daemon.migrate_user_config(
+            {"config_schema_version": 8, "max_parallel_resumes": 4}
+        )
+
+        self.assertEqual(migrated["max_parallel_resumes"], 4)
+        self.assertEqual(migrated["config_schema_version"], 9)
 
 
 class DetectionTests(unittest.TestCase):
@@ -379,17 +477,55 @@ class DetectionTests(unittest.TestCase):
                 self.assertEqual(watcher.state["phase"], "resuming")
                 self.assertEqual(len(watcher.state["candidate_backlog"]), 0)
 
+    def test_new_circuit_open_preserves_previous_pending_queue(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            config = {
+                **daemon.DEFAULT_CONFIG,
+                "max_candidates_per_incident": 2,
+                "recovery_grace_seconds": 0,
+            }
+            watcher = daemon.Watcher(config, dry_run=True)
+            old_item = {"thread_id": "thread-old", "turn_id": "turn-old", "title": "旧队列"}
+            backlog_item = {
+                "thread_id": "thread-backlog",
+                "turn_id": "turn-backlog",
+                "title": "旧候补",
+            }
+            new_item = {"thread_id": "thread-new", "turn_id": "turn-new", "title": "新任务"}
+            watcher.state["phase"] = "resuming"
+            watcher.state["queue"] = [old_item]
+            watcher.state["candidate_backlog"] = [backlog_item]
+
+            watcher.handle_open(100, "Open")
+            watcher.handle_closed(101, "Closed")
+            with mock.patch.object(
+                daemon,
+                "build_candidates",
+                return_value=([dict(old_item), new_item], []),
+            ):
+                watcher.prepare_queue_if_ready(101)
+
+            self.assertEqual(watcher.state["queue"], [old_item, backlog_item])
+            self.assertEqual(watcher.state["candidate_backlog"], [new_item])
+            self.assertEqual(watcher.state["phase"], "resuming")
+
     def test_maintenance_uses_hours_not_double_hours(self):
         state = daemon.initial_state()
         now = 200000
         state["last_cleanup_at"] = 0
         state["resumed_turns"] = {"old": {"resumed_at": now - 86401}}
+        state["recovery_attributions"] = {
+            "old": {"recorded_at": now - 86401},
+            "recent": {"recorded_at": now - 60},
+        }
         with tempfile.TemporaryDirectory() as tmp:
             with isolated_runtime(Path(tmp)):
                 watcher = daemon.Watcher({**daemon.DEFAULT_CONFIG, "model_retry_watch_hours": 24}, dry_run=True)
                 watcher.state = state
                 watcher.maintenance(now)
                 self.assertNotIn("old", watcher.state["resumed_turns"])
+                self.assertNotIn("old", watcher.state["recovery_attributions"])
+                self.assertIn("recent", watcher.state["recovery_attributions"])
 
     def test_runtime_path_contains_user_node_locations(self):
         config = dict(daemon.DEFAULT_CONFIG)
@@ -927,6 +1063,160 @@ class ModelRetryTests(unittest.TestCase):
             finally:
                 daemon.APP_HOME, daemon.STATE_PATH, daemon.PAUSE_PATH = old_paths
 
+    def test_due_retry_uses_free_parallel_slot(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-parallel", started_at=now - 5),
+                    event(
+                        "task_complete",
+                        turn_id="turn-parallel",
+                        completed_at=now - 1,
+                        last_agent_message=None,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                ],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"max_parallel_resumes": 2, "codex_sessions_dir": str(root)})
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["inflight"] = {
+                "other-thread": {"thread_id": "other-thread", "status": "running"}
+            }
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": thread_id,
+                    "turn_id": "turn-parallel",
+                    "title": "等待中的独立任务",
+                    "cwd": str(root),
+                    "rollout_path": str(rollout),
+                    "not_before": now - 1,
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual([item["thread_id"] for item in watcher.state["queue"]], [thread_id])
+            self.assertEqual(watcher.state["scheduled_retries"], [])
+            self.assertEqual(watcher.state["phase"], "resuming")
+
+    def test_stalled_active_turn_uses_free_parallel_slot_when_idle(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [event("task_started", turn_id="turn-stalled", started_at=now - 1000)],
+            )
+            os.utime(rollout, (now - 1000, now - 1000))
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update(
+                {
+                    "max_parallel_resumes": 2,
+                    "active_thread_idle_seconds": 240,
+                    "codex_sessions_dir": str(root),
+                }
+            )
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["inflight"] = {
+                "other-thread": {"thread_id": "other-thread", "status": "running"}
+            }
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": thread_id,
+                    "turn_id": "turn-stalled",
+                    "title": "等待中的僵住任务",
+                    "cwd": str(root),
+                    "rollout_path": str(rollout),
+                    "not_before": now - 1,
+                    "source": "stalled_turn",
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual([item["thread_id"] for item in watcher.state["queue"]], [thread_id])
+            self.assertEqual(watcher.state["scheduled_retries"], [])
+
+    def test_recent_active_stalled_turn_is_delayed(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [event("task_started", turn_id="turn-fresh", started_at=now - 5)],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update(
+                {
+                    "max_parallel_resumes": 2,
+                    "active_thread_idle_seconds": 240,
+                    "codex_sessions_dir": str(root),
+                }
+            )
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": thread_id,
+                    "turn_id": "turn-fresh",
+                    "title": "仍在输出的任务",
+                    "cwd": str(root),
+                    "rollout_path": str(rollout),
+                    "not_before": now - 1,
+                    "source": "stalled_turn",
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual(watcher.state["queue"], [])
+            self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
+            self.assertGreater(watcher.state["scheduled_retries"][0]["not_before"], now)
+
+    def test_retry_discovery_continues_while_another_resume_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-discover", started_at=now - 5),
+                    event(
+                        "task_complete",
+                        turn_id="turn-discover",
+                        completed_at=now - 1,
+                        last_agent_message=None,
+                        error={"message": "Selected model is at capacity"},
+                    ),
+                ],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_sessions_dir": str(root), "codex_state_db": str(root / "missing.db")})
+            watcher = daemon.Watcher(config, dry_run=True)
+            watcher.state["phase"] = "resuming"
+            watcher.state["inflight"] = {"other-thread": {"thread_id": "other-thread"}}
+            watcher.state["last_error_scan_at"] = 0
+            watcher.state["retry_scan_cursor"] = now - 10
+
+            watcher.discover_retryable_failures(now)
+
+            self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
+            self.assertEqual(watcher.state["scheduled_retries"][0]["thread_id"], thread_id)
+
     def test_retry_watch_window_ignores_old_capacity_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1116,6 +1406,229 @@ class ReliabilityTests(unittest.TestCase):
             self.assertNotIn(self.thread_id, watcher.state["reasoning_last_capacity_at"])
             self.assertIn(self.thread_id, watcher.state["reasoning_restore_pending"])
 
+    def test_auto_resume_success_requires_matching_launch_marker(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            marker = "auto-marker-123"
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-auto", started_at=now - 2),
+                    event("user_message", message="继续\n[Codex熔断续聊:{}]".format(marker)),
+                    event("user_message", message="补充：完成后再跑一次测试"),
+                    event("task_complete", turn_id="turn-auto", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            item = self.queue_item(root, rollout, turn_id="turn-failed")
+            item["resume_marker"] = marker
+            watcher.state["inflight"] = {self.thread_id: dict(item)}
+
+            watcher.finish_inflight(item, 0, now)
+
+            self.assertEqual(watcher.state["resume_success_count"], 1)
+            self.assertEqual(watcher.state["manual_recovery_count"], 0)
+            self.assertIn("自动续接成功", watcher.state["last_event"])
+
+    def test_completed_recovery_attribution_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            marker = "idempotent-marker"
+            item = {
+                "thread_id": self.thread_id,
+                "turn_id": "turn-failed",
+                "title": "只计一次",
+                "resume_marker": marker,
+            }
+            current = {
+                "state": "complete",
+                "turn_id": "turn-auto",
+                "user_message": "继续\n[Codex熔断续聊:{}]".format(marker),
+            }
+
+            first = watcher.record_completed_recovery(item, current, 100)
+            second = watcher.record_completed_recovery(item, current, 101)
+
+            self.assertEqual(first, "auto")
+            self.assertEqual(second, "auto")
+            self.assertEqual(watcher.state["resume_success_count"], 1)
+            self.assertEqual(len(watcher.state["recovery_attributions"]), 1)
+
+    def test_manual_continue_is_not_counted_as_auto_resume_success(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-manual", started_at=now - 2),
+                    event("user_message", message="继续"),
+                    event("task_complete", turn_id="turn-manual", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            item = self.queue_item(root, rollout, turn_id="turn-failed")
+            item["resume_marker"] = "different-auto-marker"
+            watcher.state["inflight"] = {self.thread_id: dict(item)}
+
+            watcher.finish_inflight(item, 0, now)
+
+            self.assertEqual(watcher.state["resume_success_count"], 0)
+            self.assertEqual(watcher.state["manual_recovery_count"], 1)
+            self.assertIn("手动继续后完成", watcher.state["last_event"])
+
+    def test_same_turn_self_completion_is_not_counted_as_manual_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-original", started_at=now - 2),
+                    event("user_message", message="原始项目要求"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-original",
+                        completed_at=now,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            item = self.queue_item(root, rollout, turn_id="turn-original")
+
+            watcher.finish_inflight(item, 0, now)
+
+            self.assertEqual(watcher.state["resume_success_count"], 0)
+            self.assertEqual(watcher.state["manual_recovery_count"], 0)
+            self.assertIn("任务已自行完成", watcher.state["last_event"])
+
+    def test_gateway_success_expedites_retry_without_server_hint(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            now = int(time.time())
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"retry_recovery_probe_seconds": 15, "retry_recovery_grace_seconds": 20})
+            watcher = daemon.Watcher(config)
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-wake",
+                    "title": "恢复唤醒",
+                    "detected_at": now - 100,
+                    "not_before": now + 900,
+                    "server_hint_seconds": None,
+                }
+            ]
+            with mock.patch.object(daemon, "latest_success_after", return_value=now - 1):
+                self.assertTrue(watcher.expedite_retries_after_recovery(now))
+            self.assertEqual(watcher.state["scheduled_retries"][0]["not_before"], now + 20)
+            self.assertIn("线路已恢复", watcher.state["last_event"])
+
+    def test_gateway_success_preserves_explicit_retry_after(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            now = int(time.time())
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-hint",
+                    "title": "遵守上游等待",
+                    "detected_at": now - 100,
+                    "not_before": now + 900,
+                    "server_hint_seconds": 900,
+                }
+            ]
+            with mock.patch.object(daemon, "latest_success_after", return_value=now - 1):
+                self.assertFalse(watcher.expedite_retries_after_recovery(now))
+            self.assertEqual(watcher.state["scheduled_retries"][0]["not_before"], now + 900)
+
+    def test_gateway_success_only_expedites_failures_older_than_success(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            now = int(time.time())
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["scheduled_retries"] = [
+                {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-before-success",
+                    "title": "旧故障",
+                    "detected_at": now - 100,
+                    "not_before": now + 900,
+                    "server_hint_seconds": None,
+                },
+                {
+                    "thread_id": "019aaaab-bbbb-7ccc-8ddd-eeeeeeeeeeee",
+                    "turn_id": "turn-after-success",
+                    "title": "新故障",
+                    "detected_at": now - 10,
+                    "not_before": now + 900,
+                    "server_hint_seconds": None,
+                },
+            ]
+
+            with mock.patch.object(daemon, "latest_success_after", return_value=now - 50):
+                self.assertTrue(watcher.expedite_retries_after_recovery(now))
+
+            old_failure, new_failure = watcher.state["scheduled_retries"]
+            self.assertEqual(old_failure["not_before"], now + 20)
+            self.assertEqual(old_failure["recovery_detected_at"], now - 50)
+            self.assertEqual(new_failure["not_before"], now + 900)
+            self.assertNotIn("recovery_detected_at", new_failure)
+
+    def test_due_retry_records_manual_completion_instead_of_auto_success(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-manual", started_at=now - 2),
+                    event("user_message", message="继续"),
+                    event("task_complete", turn_id="turn-manual", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            watcher.state["scheduled_retries"] = [
+                {
+                    **self.queue_item(root, rollout, turn_id="turn-failed"),
+                    "not_before": now,
+                }
+            ]
+
+            watcher.promote_due_retries(now)
+
+            self.assertEqual(watcher.state["scheduled_retries"], [])
+            self.assertEqual(watcher.state["manual_recovery_count"], 1)
+            self.assertIn("你手动继续后完成", watcher.state["last_event"])
+
+    def test_launch_queue_records_manual_completion_before_starting_cli(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-manual", started_at=now - 2),
+                    event("user_message", message="继续"),
+                    event("task_complete", turn_id="turn-manual", completed_at=now, last_agent_message="done"),
+                ],
+            )
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"notify": False, "codex_proxy_route_repair_enabled": False})
+            watcher = daemon.Watcher(config)
+            watcher.state["phase"] = "resuming"
+            watcher.state["queue"] = [self.queue_item(root, rollout, turn_id="turn-failed")]
+            with mock.patch.object(daemon.subprocess, "Popen") as popen:
+                watcher.launch_next(now)
+            popen.assert_not_called()
+            self.assertEqual(watcher.state["manual_recovery_count"], 1)
+            self.assertIn("你手动继续后完成", watcher.state["last_event"])
+
     def test_dry_run_never_updates_desktop_reasoning(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             config = dict(daemon.DEFAULT_CONFIG)
@@ -1143,6 +1656,39 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(restored["queue"], state["queue"])
             self.assertGreater(restored["state_recovered_at"], 0)
             self.assertIn("安全备份", restored["last_event"])
+
+    def test_upgrade_separates_legacy_launch_count_from_precise_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            daemon.ensure_dirs()
+            legacy = daemon.initial_state()
+            legacy.pop("resume_metrics_started_at")
+            legacy.pop("legacy_resume_count")
+            legacy["resume_count"] = 19
+            daemon.atomic_write_json(daemon.STATE_PATH, legacy)
+
+            restored = daemon.load_state()
+
+            self.assertEqual(restored["legacy_resume_count"], 19)
+            self.assertEqual(restored["resume_count"], 0)
+            self.assertEqual(restored["resume_success_count"], 0)
+            self.assertEqual(restored["manual_recovery_count"], 0)
+            self.assertGreater(restored["resume_metrics_started_at"], 0)
+
+    def test_upgrade_tolerates_invalid_legacy_launch_count(self):
+        for invalid_value in ("not-a-number", {"count": 19}, -3):
+            with self.subTest(invalid_value=invalid_value), tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+                daemon.ensure_dirs()
+                legacy = daemon.initial_state()
+                legacy.pop("resume_metrics_started_at")
+                legacy.pop("legacy_resume_count")
+                legacy["resume_count"] = invalid_value
+                daemon.atomic_write_json(daemon.STATE_PATH, legacy)
+
+                restored = daemon.load_state()
+
+                self.assertEqual(restored["legacy_resume_count"], 0)
+                self.assertEqual(restored["resume_count"], 0)
+                self.assertGreater(restored["resume_metrics_started_at"], 0)
 
     def test_gateway_retry_temporarily_bypasses_p1_without_reordering(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
@@ -1218,13 +1764,18 @@ class ReliabilityTests(unittest.TestCase):
             watcher = daemon.Watcher(config)
             item = self.queue_item(root, rollout, turn_id="turn-gateway-launch")
             item["gateway_failover_bypass"] = True
+            waiting_item = {
+                **item,
+                "thread_id": "019fb64d-d041-7842-adbf-01b165ad1b99",
+                "title": "后续排队任务",
+            }
             watcher.state["phase"] = "resuming"
-            watcher.state["queue"] = [item]
+            watcher.state["queue"] = [item, waiting_item]
             with mock.patch.object(daemon.subprocess, "Popen", side_effect=OSError("temporary spawn failure")):
                 watcher.launch_next(int(time.time()))
             with daemon.sqlite_connection(str(cc_db)) as db:
                 self.assertEqual(db.execute("SELECT in_failover_queue FROM providers WHERE id='p1'").fetchone()[0], 1)
-            self.assertEqual(watcher.state["queue"], [])
+            self.assertEqual(watcher.state["queue"], [waiting_item])
             self.assertEqual(len(watcher.state["scheduled_retries"]), 1)
 
     def test_popen_failure_does_not_permanently_deduplicate(self):

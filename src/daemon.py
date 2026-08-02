@@ -41,6 +41,8 @@ LOG_PATH = APP_HOME / "logs" / "watcher.log"
 RUN_LOG_DIR = APP_HOME / "logs" / "runs"
 PROVIDERS_PATH = APP_HOME / "providers.json"
 EXCHANGE_RATE_CACHE_PATH = APP_HOME / "exchange-rate.json"
+APP_VERSION = "2.8.0"
+USER_AGENT = "CodexCircuitResumer/{}".format(APP_VERSION)
 
 
 @contextmanager
@@ -53,7 +55,7 @@ def sqlite_connection(*args, **kwargs):
         connection.close()
 
 DEFAULT_CONFIG = {
-    "config_schema_version": 8,
+    "config_schema_version": 9,
     "cc_switch_log": str(Path.home() / ".cc-switch" / "logs" / "cc-switch.log"),
     "cc_switch_db": str(Path.home() / ".cc-switch" / "cc-switch.db"),
     "codex_state_db": str(Path.home() / ".codex" / "state_5.sqlite"),
@@ -74,7 +76,7 @@ DEFAULT_CONFIG = {
     "poll_seconds": 2,
     "candidate_window_padding_seconds": 8,
     "max_candidates_per_incident": 8,
-    "max_parallel_resumes": 1,
+    "max_parallel_resumes": 2,
     "resume_prompt": "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。",
     "notify": True,
     "model_retry_enabled": True,
@@ -86,6 +88,8 @@ DEFAULT_CONFIG = {
     "model_retry_server_hint_max_seconds": 3600,
     "model_retry_max_attempts": 50,
     "model_retry_watch_hours": 24,
+    "retry_recovery_probe_seconds": 15,
+    "retry_recovery_grace_seconds": 20,
     "capacity_reasoning_fallback_enabled": True,
     "capacity_reasoning_minimum": "low",
     "capacity_reasoning_promote_enabled": True,
@@ -191,13 +195,38 @@ def setup_logging():
     )
 
 
+def migrate_user_config(user_config):
+    current = dict(user_config)
+    try:
+        old_version = max(1, int(current.get("config_schema_version") or 1))
+    except (TypeError, ValueError, OverflowError):
+        old_version = 1
+    if old_version < 9:
+        if current.get("max_parallel_resumes", 1) == 1:
+            current["max_parallel_resumes"] = 2
+        current["retry_recovery_probe_seconds"] = nonnegative_int(
+            current.get("retry_recovery_probe_seconds"), 15
+        ) or 15
+        current["retry_recovery_grace_seconds"] = nonnegative_int(
+            current.get("retry_recovery_grace_seconds"), 20
+        ) or 20
+        current["config_schema_version"] = 9
+    return current
+
+
 def load_config():
     config = dict(DEFAULT_CONFIG)
     try:
         with CONFIG_PATH.open("r", encoding="utf-8") as handle:
             user_config = json.load(handle)
         if isinstance(user_config, dict):
-            config.update(user_config)
+            migrated = migrate_user_config(user_config)
+            config.update(migrated)
+            if migrated != user_config:
+                ensure_dirs()
+                atomic_write_json(CONFIG_PATH, migrated)
+                if not IS_WINDOWS:
+                    CONFIG_PATH.chmod(0o600)
     except FileNotFoundError:
         pass
     except Exception as exc:
@@ -218,8 +247,15 @@ def initial_state():
         "last_event": "等待 CC Switch 熔断事件",
         "last_event_at": int(time.time()),
         "resume_count": 0,
+        "resume_success_count": 0,
+        "manual_recovery_count": 0,
+        "legacy_resume_count": 0,
+        "resume_metrics_started_at": int(time.time()),
+        "recovery_attributions": {},
         "last_success_at": 0,
         "last_success_title": "",
+        "last_manual_recovery_at": 0,
+        "last_manual_recovery_title": "",
         "scheduled_retries": [],
         "retry_attempts": {},
         "reasoning_efforts": {},
@@ -230,6 +266,7 @@ def initial_state():
         "retry_scan_cursor": None,
         "watch_started_at": int(time.time()),
         "last_retry_scan_at": 0,
+        "last_retry_recovery_check_at": 0,
         "last_error_scan_at": 0,
         "last_provider_snapshot_at": 0,
         "last_balance_probe_at": 0,
@@ -270,6 +307,13 @@ def state_backup_path():
     return STATE_PATH.with_name("state.backup.json")
 
 
+def nonnegative_int(value, default=0):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def load_state():
     primary_existed = STATE_PATH.exists()
     backup_existed = state_backup_path().exists()
@@ -281,8 +325,14 @@ def load_state():
     base = initial_state()
     if state is not None:
         base.update(state)
+        if "resume_metrics_started_at" not in state:
+            base["legacy_resume_count"] = nonnegative_int(state.get("resume_count"))
+            base["resume_count"] = 0
+            base["resume_success_count"] = 0
+            base["manual_recovery_count"] = 0
+            base["resume_metrics_started_at"] = int(time.time())
     base["version"] = 2
-    for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "reasoning_restore_pending", "reasoning_restore_last_scan", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures"):
+    for key in ("resumed_turns", "retry_attempts", "reasoning_efforts", "reasoning_originals", "reasoning_last_capacity_at", "reasoning_restore_pending", "reasoning_restore_last_scan", "balance_cache", "billing_cache", "exchange_rate_cache", "inflight", "blocked", "launcher_failures", "recovery_attributions"):
         if not isinstance(base.get(key), dict):
             base[key] = {}
     for key in ("queue", "candidate_backlog", "scheduled_retries", "temporary_failover_bypasses"):
@@ -899,7 +949,7 @@ def update_thread_reasoning_effort(config, thread_id, effort):
             1,
             "initialize",
             {
-                "clientInfo": {"name": "codex-circuit-resumer", "version": "2.7.0"},
+                "clientInfo": {"name": "codex-circuit-resumer", "version": APP_VERSION},
                 "capabilities": {"experimentalApi": True},
             },
         )
@@ -1125,11 +1175,32 @@ def latest_turn_status(path):
             "error": None,
             "started_at": None,
             "completed_at": None,
+            "user_message": None,
+            "user_messages": [],
         }
 
     complete = None
+    user_message = None
+    user_messages = []
     for event in events[start_index + 1 :]:
         payload = event.get("payload") or {}
+        if event.get("type") == "event_msg" and payload.get("type") == "user_message":
+            message = payload.get("message")
+            if isinstance(message, str):
+                user_message = message
+                user_messages.append(message)
+        elif (
+            event.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            parts = []
+            for content in payload.get("content") or []:
+                if isinstance(content, dict) and isinstance(content.get("text"), str):
+                    parts.append(content["text"])
+            if parts:
+                user_message = "".join(parts)
+                user_messages.append(user_message)
         if event.get("type") == "event_msg" and payload.get("type") == "task_complete":
             complete = payload
 
@@ -1147,6 +1218,8 @@ def latest_turn_status(path):
             "error": None,
             "started_at": as_epoch((started or {}).get("started_at"), file_mtime),
             "completed_at": None,
+            "user_message": user_message,
+            "user_messages": user_messages,
         }
 
     final_message = complete.get("last_agent_message")
@@ -1160,6 +1233,8 @@ def latest_turn_status(path):
             "error": None,
             "started_at": started_at,
             "completed_at": completed_at,
+            "user_message": user_message,
+            "user_messages": user_messages,
         }
     if error:
         error_text = json.dumps(error, ensure_ascii=False).lower()
@@ -1170,6 +1245,8 @@ def latest_turn_status(path):
             "error": error,
             "started_at": started_at,
             "completed_at": completed_at,
+            "user_message": user_message,
+            "user_messages": user_messages,
         }
     return {
         "state": "interrupted",
@@ -1177,6 +1254,8 @@ def latest_turn_status(path):
         "error": None,
         "started_at": started_at,
         "completed_at": completed_at,
+        "user_message": user_message,
+        "user_messages": user_messages,
     }
 
 
@@ -1275,7 +1354,7 @@ def query_usd_cny_rate(timeout=5):
     )
     for endpoint, extract in endpoints:
         try:
-            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": "CodexCircuitResumer/2.6.0"})
+            request = Request(endpoint, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
             with urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
             rate = extract(payload)
@@ -1396,7 +1475,7 @@ def query_sub2api_billing(base_url, api_key, timeout=8):
         headers={
             "Authorization": "Bearer " + api_key,
             "Accept": "application/json",
-            "User-Agent": "CodexCircuitResumer/2.6.0",
+            "User-Agent": USER_AGENT,
         },
     )
     try:
@@ -2312,6 +2391,47 @@ class Watcher:
             notify("Codex 熔断续聊", "{}：{}".format(reason, item.get("title") or thread_id))
         return True
 
+    def record_completed_recovery(self, item, current, now):
+        if current.get("state") != "complete":
+            return None
+        completed_turn_id = current.get("turn_id")
+        if not completed_turn_id:
+            return None
+        attributed = self.state.setdefault("recovery_attributions", {})
+        existing = attributed.get(completed_turn_id)
+        if existing:
+            return existing.get("kind")
+        marker = str(item.get("resume_marker") or "")
+        marker_text = "[Codex熔断续聊:{}]".format(marker) if marker else ""
+        messages = current.get("user_messages")
+        if not isinstance(messages, list):
+            messages = [current.get("user_message")]
+        if marker_text and any(marker_text in str(message or "") for message in messages):
+            kind = "auto"
+        elif completed_turn_id != item.get("turn_id"):
+            kind = "manual"
+        else:
+            kind = "self"
+        attributed[completed_turn_id] = {
+            "kind": kind,
+            "thread_id": item.get("thread_id"),
+            "recorded_at": now,
+        }
+        title = item.get("title") or item.get("thread_id")
+        if kind == "auto":
+            self.state["resume_success_count"] = int(self.state.get("resume_success_count", 0)) + 1
+            self.state["last_success_at"] = now
+            self.state["last_success_title"] = title
+            self.set_event("自动续接成功：{} ({})".format(title, item.get("thread_id")), now)
+        elif kind == "manual":
+            self.state["manual_recovery_count"] = int(self.state.get("manual_recovery_count", 0)) + 1
+            self.state["last_manual_recovery_at"] = now
+            self.state["last_manual_recovery_title"] = title
+            self.set_event("检测到你手动继续后完成：{} ({})".format(title, item.get("thread_id")), now)
+        else:
+            self.set_event("任务已自行完成，取消无人值守重试：{}".format(title), now)
+        return kind
+
     def finish_inflight(self, item, result, now):
         thread_id = item.get("thread_id")
         turn_id = item.get("turn_id")
@@ -2331,9 +2451,7 @@ class Watcher:
             self.state.setdefault("launcher_failures", {}).pop(thread_id, None)
             self.state.setdefault("blocked", {}).pop(thread_id, None)
             self.clear_reasoning_state(thread_id)
-            self.state["last_success_at"] = now
-            self.state["last_success_title"] = item.get("title") or thread_id
-            self.set_event("续接成功完成：{} ({})".format(item.get("title"), thread_id), now)
+            self.record_completed_recovery(item, current, now)
             return
 
         if current.get("turn_id") != turn_id:
@@ -2420,6 +2538,37 @@ class Watcher:
         if success_at:
             self.handle_closed(success_at, "由 CC Switch 成功请求确认线路恢复")
 
+    def expedite_retries_after_recovery(self, now):
+        scheduled = self.state.get("scheduled_retries") or []
+        if not scheduled:
+            return False
+        interval = max(5, int(self.config.get("retry_recovery_probe_seconds", 15)))
+        last_check = int(self.state.get("last_retry_recovery_check_at") or 0)
+        if now - last_check < interval:
+            return False
+        self.state["last_retry_recovery_check_at"] = now
+        detected = [int(item.get("detected_at") or 0) for item in scheduled if item.get("detected_at")]
+        if not detected:
+            return False
+        success_at = latest_success_after(self.config, min(detected))
+        if not success_at:
+            return False
+        grace = max(5, int(self.config.get("retry_recovery_grace_seconds", 20)))
+        wake_at = now + grace
+        changed = False
+        for item in scheduled:
+            if item.get("server_hint_seconds"):
+                continue
+            if success_at < int(item.get("detected_at") or 0):
+                continue
+            if int(item.get("not_before") or 0) > wake_at:
+                item["not_before"] = wake_at
+                item["recovery_detected_at"] = success_at
+                changed = True
+        if changed:
+            self.set_event("检测到线路已恢复，待重试任务将在 {} 秒保护期后提前继续".format(grace), now)
+        return changed
+
     def maintenance(self, now):
         last_cleanup = int(self.state.get("last_cleanup_at") or 0)
         if now - last_cleanup < 3600:
@@ -2434,6 +2583,10 @@ class Watcher:
         for thread_id, item in list(blocked.items()):
             if int(item.get("blocked_at") or 0) < cutoff:
                 blocked.pop(thread_id, None)
+        attributed = self.state.setdefault("recovery_attributions", {})
+        for turn_id, item in list(attributed.items()):
+            if int(item.get("recorded_at") or 0) < cutoff:
+                attributed.pop(turn_id, None)
         cleanup_run_logs(self.config, now)
 
     def handle_open(self, when, line=""):
@@ -2445,8 +2598,6 @@ class Watcher:
             "recovered_at": None,
             "source_line": line.strip()[-500:],
         }
-        self.state["queue"] = []
-        self.state["candidate_backlog"] = []
         self.set_event("检测到 CC Switch 熔断，开始记录受影响任务", when)
         save_state(self.state)
 
@@ -2527,6 +2678,18 @@ class Watcher:
         candidates, pending = build_candidates(
             self.config, incident, self.state, now, include_pending=True
         )
+        carryover = list(self.state.get("queue") or []) + list(
+            self.state.get("candidate_backlog") or []
+        )
+        merged_candidates = []
+        seen = set()
+        for item in carryover + candidates:
+            key = (item.get("thread_id"), item.get("turn_id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_candidates.append(item)
+        candidates = merged_candidates
         batch_size = max(1, int(self.config.get("max_candidates_per_incident", 8)))
         self.state["queue"] = candidates[:batch_size]
         self.state["candidate_backlog"] = candidates[batch_size:]
@@ -2535,7 +2698,7 @@ class Watcher:
             total = len(candidates)
             queued = len(self.state["queue"])
             remaining = len(self.state["candidate_backlog"])
-            message = "找到 {} 条中断任务，开始串行续接".format(total)
+            message = "找到 {} 条中断任务，开始安全续接".format(total)
             if remaining:
                 message = "找到 {} 条中断任务，先续接 {} 条，另有 {} 条已安全排队".format(
                     total, queued, remaining
@@ -2754,8 +2917,10 @@ class Watcher:
     def discover_retryable_failures(self, now):
         if not self.config.get("model_retry_enabled", True):
             return
-        # Avoid competing with circuit recovery flow.
-        if self.state.get("phase") in {"circuit_open", "recovery_grace", "resuming"}:
+        # Avoid competing with the circuit recovery flow. Retry discovery can
+        # continue while another task is being resumed; launch_next enforces
+        # the configured concurrency limit.
+        if self.state.get("phase") in {"circuit_open", "recovery_grace"}:
             return
         scan_interval = max(2, int(self.config.get("retry_error_scan_seconds", 10)))
         last_error_scan = int(self.state.get("last_error_scan_at") or 0)
@@ -2837,9 +3002,11 @@ class Watcher:
 
     def promote_due_retries(self, now):
         # Don't compete with circuit-breaker recovery flow.
-        if self.state.get("phase") in {"circuit_open", "recovery_grace", "resuming"}:
+        if self.state.get("phase") in {"circuit_open", "recovery_grace"}:
             return
-        if self.processes or self.state.get("inflight"):
+        inflight = self.state.setdefault("inflight", {})
+        max_parallel = max(1, int(self.config.get("max_parallel_resumes", 1)))
+        if len(inflight) >= max_parallel:
             return
         scheduled = self.state.get("scheduled_retries") or []
         due = [item for item in scheduled if int(item.get("not_before") or 0) <= now]
@@ -2859,7 +3026,7 @@ class Watcher:
             self.state.setdefault("reasoning_efforts", {}).pop(item.get("thread_id"), None)
             self.state.setdefault("reasoning_originals", {}).pop(item.get("thread_id"), None)
             self.state.setdefault("reasoning_last_capacity_at", {}).pop(item.get("thread_id"), None)
-            self.set_event("任务已自行完成，取消无人值守重试：{}".format(item.get("title")), now)
+            self.record_completed_recovery(item, current, now)
             save_state(self.state)
             return
         if current.get("turn_id") != item.get("turn_id"):
@@ -2870,13 +3037,27 @@ class Watcher:
             save_state(self.state)
             return
         if current.get("state") == "active":
-            # User or another resume is already running; re-check later.
-            item["not_before"] = now + int(self.config.get("model_retry_base_seconds", 60))
-            scheduled.append(item)
-            self.set_event("任务仍在执行，延后重试：{}".format(item.get("title")), now)
+            stale_active = False
+            if item.get("source") == "stalled_turn":
+                idle_seconds = int(self.config.get("active_thread_idle_seconds", 240))
+                try:
+                    modified_at = int(rollout.stat().st_mtime)
+                except OSError:
+                    modified_at = now
+                stale_active = modified_at <= now - idle_seconds
+            if not stale_active:
+                # User or another resume is already running; re-check later.
+                item["not_before"] = now + int(self.config.get("model_retry_base_seconds", 60))
+                scheduled.append(item)
+                self.set_event("任务仍在执行，延后重试：{}".format(item.get("title")), now)
+                save_state(self.state)
+                return
+
+        queue = self.state.setdefault("queue", [])
+        if any(existing.get("thread_id") == item.get("thread_id") for existing in queue):
             save_state(self.state)
             return
-        self.state["queue"] = [item]
+        queue.append(item)
         self.state["phase"] = "resuming"
         self.set_event("无人值守重试到点：{}".format(item.get("title")), now)
         save_state(self.state)
@@ -2981,6 +3162,7 @@ class Watcher:
             self.state["proxy_route_retry_at"] = 0
 
         item = queue.pop(0)
+        remaining_queue = list(queue)
         current = latest_turn_status(Path(item["rollout_path"]))
         if current.get("turn_id") != item["turn_id"] or current.get("state") == "complete":
             self.state.setdefault("reasoning_efforts", {}).pop(item.get("thread_id"), None)
@@ -2989,7 +3171,10 @@ class Watcher:
             # Do not discard reasoning_restore_pending here. A user may have
             # continued the failed high-effort turn manually at medium; the
             # idle Desktop sync still needs to restore the original tier.
-            self.set_event("跳过已被手动恢复的任务：{}".format(item["title"]), now)
+            if current.get("state") == "complete":
+                self.record_completed_recovery(item, current, now)
+            else:
+                self.set_event("跳过已被手动恢复的任务：{}".format(item["title"]), now)
             save_state(self.state)
             return
 
@@ -3002,7 +3187,7 @@ class Watcher:
         if item.get("gateway_failover_bypass"):
             # Persist the popped item before the bypass mutation.  A crash in
             # the tiny window before Popen must replay the task, not lose it.
-            self.state["queue"] = [item]
+            self.state["queue"] = [item] + remaining_queue
             save_state(self.state)
             bypass = temporarily_bypass_first_codex_provider(
                 self.config,
@@ -3013,11 +3198,14 @@ class Watcher:
             if bypass:
                 item["temporary_bypass_provider_id"] = bypass.get("provider_id")
                 item["temporary_bypass_provider_name"] = bypass.get("provider_name")
-            self.state["queue"] = []
+            self.state["queue"] = remaining_queue
 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         run_log = RUN_LOG_DIR / "{}-{}.log".format(timestamp, item["thread_id"])
         launch_item = dict(item)
+        resume_marker = "{}-{}-{:08x}".format(
+            item["thread_id"][-8:], now, random.getrandbits(32)
+        )
         launch_item.update(
             {
                 "status": "launching",
@@ -3026,6 +3214,7 @@ class Watcher:
                 "run_log": str(run_log),
                 "exit_code": None,
                 "exited_at": None,
+                "resume_marker": resume_marker,
             }
         )
         inflight[item["thread_id"]] = launch_item
@@ -3045,7 +3234,7 @@ class Watcher:
         command.extend([
             "resume",
             item["thread_id"],
-            self.config["resume_prompt"],
+            "{}\n\n[Codex熔断续聊:{}]".format(self.config["resume_prompt"], resume_marker),
         ])
         child_env = os.environ.copy()
         path_parts = list(self.config.get("extra_path", []))
@@ -3066,7 +3255,7 @@ class Watcher:
             if log_handle is not None:
                 log_handle.close()
             inflight.pop(item["thread_id"], None)
-            self.state["queue"] = []
+            self.state["queue"] = remaining_queue
             if bypass:
                 restore_temporary_failover_bypasses(
                     self.config, self.state, provider_id=bypass.get("provider_id"), now=now
@@ -3101,7 +3290,7 @@ class Watcher:
             "log_handle": log_handle,
             **launch_item,
         }
-        self.set_event("已自动续接：{} ({})".format(item["title"], item["thread_id"]), now)
+        self.set_event("已发起自动续接，等待确认结果：{} ({})".format(item["title"], item["thread_id"]), now)
         if self.config.get("notify"):
             notify("Codex 熔断续聊", "线路恢复，已续接：{}".format(item["title"]))
         save_state(self.state)
@@ -3121,13 +3310,14 @@ class Watcher:
         self.reconcile_inflight(now)
         self.reconcile_circuit(now)
         self.discover_retryable_failures(now)
+        recovery_changed = self.expedite_retries_after_recovery(now)
         self.refresh_provider_snapshot(now)
         restore_changed = self.restore_due_desktop_reasoning(now)
         self.prepare_queue_if_ready(now)
         self.promote_due_retries(now)
         self.launch_next(now)
         self.maintenance(now)
-        if restore_changed:
+        if restore_changed or recovery_changed:
             save_state(self.state)
         self.state["heartbeat_at"] = int(time.time())
         self.state["last_tick_duration_ms"] = int((time.monotonic() - started) * 1000)

@@ -1,5 +1,5 @@
 {
-  "config_schema_version": 8,
+  "config_schema_version": 9,
   "codex_state_db": "~/.codex/state_5.sqlite",
   "recovery_grace_seconds": 20,
   "active_thread_idle_seconds": 240,
@@ -10,7 +10,7 @@
     "/usr/local/bin"
   ],
   "max_candidates_per_incident": 8,
-  "max_parallel_resumes": 1,
+  "max_parallel_resumes": 2,
   "resume_prompt": "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。",
   "notify": true,
   "model_retry_enabled": true,
@@ -22,6 +22,8 @@
   "model_retry_server_hint_max_seconds": 3600,
   "model_retry_max_attempts": 50,
   "model_retry_watch_hours": 24,
+  "retry_recovery_probe_seconds": 15,
+  "retry_recovery_grace_seconds": 20,
   "capacity_reasoning_fallback_enabled": true,
   "capacity_reasoning_minimum": "low",
   "capacity_reasoning_promote_enabled": true,
