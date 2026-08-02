@@ -89,6 +89,12 @@ if old_version < 9:
     current["retry_recovery_probe_seconds"] = int(current.get("retry_recovery_probe_seconds") or 15)
     current["retry_recovery_grace_seconds"] = int(current.get("retry_recovery_grace_seconds") or 20)
     current["config_schema_version"] = 9
+if old_version < 10:
+    legacy_prompt = "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。"
+    new_prompt = "继续上一条用户请求中尚未完成的工作，直接动手；不要讨论熔断续聊软件本身，不要重复已经完成的内容。"
+    if str(current.get("resume_prompt") or "").strip() in {"", legacy_prompt}:
+        current["resume_prompt"] = new_prompt
+    current["config_schema_version"] = 10
 merged = dict(defaults)
 merged.update(current)
 config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -181,6 +187,29 @@ phase_names = {
     "recovery_grace": "线路已恢复，等待稳定",
     "resuming": "正在续接任务",
 }
+def human_event(value):
+    text = str(value or "")
+    if "cannot restore Codex thread reasoning effort" in text or "未确认保存目标档位" in text:
+        return "推理档位暂未确认，不影响当前续接，稍后会再检查"
+    if "已发起自动续接" in text:
+        return "已自动接回原对话，正在等待 Codex 返回"
+    if "自动续接成功" in text:
+        return "原对话已自动继续并完成"
+    if "Codex 对话已自动恢复为" in text or "对话已经是" in text:
+        return "原对话的推理档位已恢复"
+    if "已安排无人值守重试" in text:
+        if "capacity" in text.lower() or "模型满载" in text:
+            return "模型暂时满载，已安排自动重试"
+        if any(code in text for code in ("502", "503", "504")):
+            return "上游暂时故障，已安排自动重试"
+        return "线路暂时不稳定，已安排自动重试"
+    if "本轮中断任务已全部处理" in text:
+        return "这一轮中断任务已经处理完"
+    if "线路已恢复，没有需要续接" in text:
+        return "线路已恢复，当前没有需要接回的对话"
+    if "检测到 CC Switch 熔断" in text:
+        return "检测到线路熔断，已记下受影响的对话"
+    return "后台状态已更新"
 stamp = s.get("last_event_at")
 when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stamp)) if stamp else "无"
 scheduled = s.get("scheduled_retry_count")
@@ -192,7 +221,7 @@ print("状态：{}\n后台健康：{}{}\n最后事件：{}\n事件时间：{}\n�
     phase_names.get(s.get("phase"), s.get("phase", "未知")),
     heartbeat,
     "（{} 秒前）".format(heartbeat_age) if heartbeat_age is not None else "",
-    s.get("last_event", "无"),
+    human_event(s.get("last_event", "无")),
     when,
     s.get("resume_count", 0),
     s.get("resume_success_count", 0),

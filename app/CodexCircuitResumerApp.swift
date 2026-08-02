@@ -289,12 +289,104 @@ private struct WatcherEvent: Identifiable, Hashable {
     let level: String
     let message: String
 
+    var displayMessage: String { humanizeWatcherMessage(message) }
+
     var color: Color {
         if message.contains("熔断") || level == "WARNING" { return Palette.warning }
         if level == "ERROR" || message.contains("无法") { return Palette.danger }
         if message.contains("恢复") || message.contains("续接") { return Palette.success }
         return Palette.muted
     }
+}
+
+private func compactThreadLabel(_ value: String) -> String {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.isEmpty { return "Codex 对话" }
+    if text.contains("上次因中转站") || text == "继续" || text.hasPrefix("继续。") {
+        return "中断的 Codex 对话"
+    }
+    if text.count <= 24 { return text }
+    return "原 Codex 对话"
+}
+
+private func humanizeRetryReason(_ value: String) -> String {
+    let text = value.lowercased()
+    if text.contains("capacity") || text.contains("server_overloaded") || text.contains("模型满载") || text.contains("上游账号池满") {
+        return "模型暂时满载"
+    }
+    if text.contains("503") || text.contains("502") || text.contains("504") || text.contains("upstream") || text.contains("上游临时故障") {
+        return "上游暂时故障"
+    }
+    if text.contains("429") || text.contains("rate limit") {
+        return "请求太频繁"
+    }
+    if text.contains("timeout") || text.contains("timed out") {
+        return "等待超时"
+    }
+    if text.contains("401") || text.contains("token") || text.contains("authentication") {
+        return "需要重新登录 Codex"
+    }
+    return "线路恢复后自动再试"
+}
+
+private func humanizeWatcherMessage(_ value: String) -> String {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.isEmpty { return "后台正在等待下一次线路事件" }
+    if text.contains("cannot restore Codex thread reasoning effort") || text.contains("未确认保存目标档位") {
+        return "推理档位暂未确认，不影响当前续接，稍后会再检查"
+    }
+    if text.contains("已发起自动续接，等待确认结果") {
+        return "已自动接回原对话，正在等待 Codex 返回"
+    }
+    if text.contains("续接进程已退出，核对 turn 结果") {
+        return "Codex 已返回，正在确认这次续接是否完成"
+    }
+    if text.contains("自动续接成功") || text.contains("续接成功完成") {
+        return "原对话已自动继续并完成"
+    }
+    if text.contains("Codex 对话已自动恢复为") || text.contains("对话已经是") {
+        return "原对话的推理档位已恢复"
+    }
+    if text.contains("已安排无人值守重试") {
+        return "\(humanizeRetryReason(text))，已安排自动重试"
+    }
+    if text.contains("任务仍在执行，延后重试") {
+        return "原对话仍在运行，暂不重复发送"
+    }
+    if text.contains("需要人工处理") {
+        if text.contains("鉴权") || text.contains("登录") || text.contains("401") {
+            return "需要重新登录 Codex，自动续接已暂停"
+        }
+        return "有一条对话需要你处理，自动续接已暂停"
+    }
+    if text.contains("跳过已自行恢复") || text.contains("任务已自行完成") {
+        return "对话已经自行恢复，不再重复发送"
+    }
+    if text.contains("本轮中断任务已全部处理") {
+        return "这一轮中断任务已经处理完"
+    }
+    if text.contains("线路已恢复，没有需要续接") {
+        return "线路已恢复，当前没有需要接回的对话"
+    }
+    if text.contains("检测到 CC Switch 熔断") {
+        return "检测到线路熔断，已记下受影响的对话"
+    }
+    if text.contains("CC Switch 已恢复") {
+        return "线路已恢复，正在等待稳定后接回对话"
+    }
+    if text.contains("由 CC Switch 成功请求确认线路恢复") {
+        return "检测到中转线路已经恢复"
+    }
+    if text.contains("对话已经是") && text.contains("档") {
+        return "推理档位已经恢复，不需要再改"
+    }
+    if text.contains("续接进程未完成") {
+        return "这次续接没有完成，已安排稍后再试"
+    }
+    if text.contains("续接暂缓") {
+        return "线路还没准备好，暂不发送新请求"
+    }
+    return compactThreadLabel(text)
 }
 
 private struct DiagnosticItem: Identifiable, Hashable {
@@ -363,6 +455,10 @@ private final class AppModel: ObservableObject {
     @Published var blockedCount = 0
     @Published var lastSuccessAt = 0
     @Published var lastSuccessTitle = ""
+    @Published var activeTaskTitle = ""
+    @Published var activeTaskAttempt = 0
+    @Published var manualTaskTitle = ""
+    @Published var manualTaskReason = ""
     @Published var heartbeatAge: Int?
     @Published var daemonHealthy = false
     @Published var proxyRouteStatus = "unchecked"
@@ -381,7 +477,7 @@ private final class AppModel: ObservableObject {
     @Published var retryJitterSeconds = 15
     @Published var retryMaxAttempts = 50
     @Published var retryWatchHours = 24
-    @Published var resumePrompt = "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。"
+    @Published var resumePrompt = "继续上一条用户请求中尚未完成的工作，直接动手；不要讨论熔断续聊软件本身，不要重复已经完成的内容。"
     @Published var settingsDirty = false
 
     private var configObject: [String: Any] = [:]
@@ -476,14 +572,51 @@ private final class AppModel: ObservableObject {
         guard nextRetryAt > 0 else { return "暂无待重试" }
         let remaining = max(0, nextRetryAt - Int(Date().timeIntervalSince1970))
         let time = remaining <= 0 ? "即将执行" : (remaining < 60 ? "\(remaining) 秒后" : "\((remaining + 59) / 60) 分钟后")
-        return "\(time) · 第 \(max(1, nextRetryAttempt)) 次 · \(nextRetryTitle)"
+        return "\(time) · 第 \(max(1, nextRetryAttempt)) 次 · \(humanizeRetryReason(nextRetryReason))"
+    }
+
+    var currentTaskTitle: String {
+        if isPaused { return "守望器已暂停" }
+        if blockedCount > 0 && inflightCount == 0 && scheduledRetryCount == 0 && queueCount == 0 {
+            return "有对话需要你处理"
+        }
+        if inflightCount > 0 { return "正在接回原 Codex 对话" }
+        if scheduledRetryCount > 0 { return "等待线路或模型恢复" }
+        if queueCount > 0 { return "有 \(queueCount) 条对话排队" }
+        if blockedCount > 0 { return "续接进行中，另有对话需处理" }
+        if reasoningRestorePendingCount > 0 { return "原对话已继续" }
+        return "当前没有待接回的对话"
+    }
+
+    var currentTaskDetail: String {
+        if blockedCount > 0 {
+            if manualTaskReason.contains("鉴权") || manualTaskReason.contains("登录") {
+                if inflightCount > 0 || scheduledRetryCount > 0 || queueCount > 0 {
+                    return "还有一条对话需要重新登录 Codex；其余任务仍会继续自动处理。"
+                }
+                return "请先重新登录 Codex；软件不会继续重复尝试。"
+            }
+            let reason = manualTaskReason.isEmpty ? "请打开事件记录查看原因。" : manualTaskReason
+            if inflightCount > 0 || scheduledRetryCount > 0 || queueCount > 0 {
+                return "还有一条对话需要处理：\(reason)；其余任务仍会继续自动处理。"
+            }
+            return reason
+        }
+        if inflightCount > 0 {
+            return "\(activeTaskTitle.isEmpty ? "原对话" : activeTaskTitle) · 不会新建聊天，只在原对话继续。"
+        }
+        if scheduledRetryCount > 0 { return nextRetrySummary }
+        if queueCount > 0 { return "线路恢复后按队列顺序处理，不会丢失。" }
+        if reasoningRestorePendingCount > 0 { return "现在没有正在处理的任务；空闲后再尝试恢复原来的推理档位。" }
+        if lastSuccessAt > 0 { return "最近已完成：\(compactThreadLabel(lastSuccessTitle))" }
+        return "后台只监听线路和任务状态，关闭这个窗口不会停止守望。"
     }
 
     var watcherDetail: String {
         if proxyRouteStatus == "unavailable" || proxyRouteStatus == "error" { return proxyRouteDetail }
         if scheduledRetryCount > 0 { return "下一次自动动作：\(nextRetrySummary)" }
-        if reasoningRestorePendingCount > 0 { return "有 \(reasoningRestorePendingCount) 条对话等待安全恢复原档位，执行中的请求不会被打断。" }
-        if lastSuccessAt > 0 && !lastSuccessTitle.isEmpty { return "\(heartbeatDetail)；最近完成：\(lastSuccessTitle)" }
+        if reasoningRestorePendingCount > 0 { return "后台正常；有 \(reasoningRestorePendingCount) 条已完成对话等待恢复原推理档位。" }
+        if lastSuccessAt > 0 && !lastSuccessTitle.isEmpty { return "\(heartbeatDetail)；最近完成：\(compactThreadLabel(lastSuccessTitle))" }
         return "\(heartbeatDetail)；关闭本窗口不影响运行。"
     }
 
@@ -507,17 +640,28 @@ private final class AppModel: ObservableObject {
 
     var phaseTitle: String {
         if isPaused { return "已暂停" }
+        if blockedCount > 0 && inflightCount == 0 && scheduledRetryCount == 0 && queueCount == 0 {
+            return "有任务需处理"
+        }
         switch phase {
         case "circuit_open": return "线路熔断中"
         case "recovery_grace": return "线路恢复观察中"
-        case "resuming": return "正在续接任务"
+        case "resuming":
+            if inflightCount > 0 || scheduledRetryCount > 0 || queueCount > 0 {
+                return "正在续接任务"
+            }
+            return "正在核对结果"
         default: return isLoaded ? "守望中" : "未启动"
         }
     }
 
     var phaseColor: Color {
         if isPaused || !isLoaded { return Palette.muted }
-        if !daemonHealthy || blockedCount > 0 { return Palette.danger }
+        if !daemonHealthy { return Palette.danger }
+        if blockedCount > 0 && inflightCount == 0 && scheduledRetryCount == 0 && queueCount == 0 {
+            return Palette.danger
+        }
+        if blockedCount > 0 { return Palette.warning }
         switch phase {
         case "circuit_open": return Palette.danger
         case "recovery_grace": return Palette.warning
@@ -611,6 +755,22 @@ private final class AppModel: ObservableObject {
         blockedCount = (state["blocked"] as? [String: Any])?.count ?? 0
         lastSuccessAt = state["last_success_at"] as? Int ?? 0
         lastSuccessTitle = state["last_success_title"] as? String ?? ""
+        if let inflight = state["inflight"] as? [String: Any],
+           let item = inflight.values.compactMap({ $0 as? [String: Any] }).first {
+            activeTaskTitle = compactThreadLabel(item["title"] as? String ?? "")
+            activeTaskAttempt = item["attempt"] as? Int ?? 0
+        } else {
+            activeTaskTitle = ""
+            activeTaskAttempt = 0
+        }
+        if let blocked = state["blocked"] as? [String: Any],
+           let item = blocked.values.compactMap({ $0 as? [String: Any] }).first {
+            manualTaskTitle = compactThreadLabel(item["title"] as? String ?? "")
+            manualTaskReason = item["reason"] as? String ?? ""
+        } else {
+            manualTaskTitle = ""
+            manualTaskReason = ""
+        }
         let heartbeatAt = state["heartbeat_at"] as? Int ?? 0
         heartbeatAge = heartbeatAt > 0 ? max(0, Int(Date().timeIntervalSince1970) - heartbeatAt) : nil
         isPaused = FileManager.default.fileExists(atPath: pauseURL.path)
@@ -871,7 +1031,7 @@ private final class AppModel: ObservableObject {
 
     func copyDiagnostics() {
         let lines = diagnostics.map { "\($0.healthy ? "正常" : "异常") | \($0.name) | \($0.detail)" }
-        let text = (["Codex 熔断续聊诊断", "状态：\(phaseTitle)", "最后事件：\(lastEvent)"] + lines).joined(separator: "\n")
+        let text = (["Codex 熔断续聊诊断", "状态：\(phaseTitle)", "最后事件：\(humanizeWatcherMessage(lastEvent))"] + lines).joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         toast = "诊断信息已复制"
@@ -947,6 +1107,7 @@ private final class AppModel: ObservableObject {
         guard let data = data ?? (try? Data(contentsOf: watcherLogURL)),
               let text = String(data: data, encoding: .utf8) else { return [] }
         let pattern = try? NSRegularExpression(pattern: "^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}),\\d+ (INFO|WARNING|ERROR) (.*)$")
+        var seen = Set<String>()
         return text.split(separator: "\n").suffix(80).reversed().compactMap { raw in
             let line = String(raw)
             let range = NSRange(line.startIndex..<line.endIndex, in: line)
@@ -955,7 +1116,9 @@ private final class AppModel: ObservableObject {
                   let levelRange = Range(match.range(at: 2), in: line),
                   let messageRange = Range(match.range(at: 3), in: line) else { return nil }
             let fullTime = String(line[timeRange])
-            return WatcherEvent(time: String(fullTime.suffix(8)), level: String(line[levelRange]), message: String(line[messageRange]))
+            let event = WatcherEvent(time: String(fullTime.suffix(8)), level: String(line[levelRange]), message: String(line[messageRange]))
+            guard seen.insert(event.displayMessage).inserted else { return nil }
+            return event
         }
     }
 
@@ -1246,10 +1409,10 @@ private struct MetricsView: View {
     var body: some View {
         HStack(spacing: 10) {
             MetricCell(label: "后台健康", value: model.healthTitle, color: model.healthColor, compact: true)
-            MetricCell(label: "自动成功", value: "\(model.resumeSuccessCount)", color: model.resumeSuccessCount > 0 ? Palette.success : Palette.ink, detail: "新版已发起 \(model.resumeCount) 次")
-            MetricCell(label: "你手动接回", value: "\(model.manualRecoveryCount)", color: model.manualRecoveryCount > 0 ? Palette.warning : Palette.ink)
-            MetricCell(label: "待处理队列", value: "\(model.queueCount + model.scheduledRetryCount + model.reasoningRestorePendingCount)", color: model.queueCount + model.scheduledRetryCount + model.reasoningRestorePendingCount > 0 ? Palette.warning : Palette.ink)
-            MetricCell(label: "需人工处理", value: "\(model.blockedCount)", color: model.blockedCount > 0 ? Palette.danger : Palette.ink)
+            MetricCell(label: "正在处理", value: "\(model.inflightCount)", color: model.inflightCount > 0 ? Palette.accent : Palette.ink, detail: "只接回原对话")
+            MetricCell(label: "待自动重试", value: "\(model.scheduledRetryCount)", color: model.scheduledRetryCount > 0 ? Palette.warning : Palette.ink)
+            MetricCell(label: "排队中的对话", value: "\(model.queueCount)", color: model.queueCount > 0 ? Palette.warning : Palette.ink)
+            MetricCell(label: "需要你处理", value: "\(model.blockedCount)", color: model.blockedCount > 0 ? Palette.danger : Palette.ink)
         }
     }
 }
@@ -1290,8 +1453,8 @@ private struct ControlBand: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("自动守望").font(.system(size: 14, weight: .semibold))
-                    Text(model.isPaused ? "已暂停，不会扫描或续接任务。" : model.watcherDetail)
+                    Text(model.currentTaskTitle).font(.system(size: 14, weight: .semibold))
+                    Text(model.isPaused ? "已暂停，不会扫描或续接任务。" : model.currentTaskDetail)
                         .font(.system(size: 11)).foregroundStyle(Palette.muted)
                         .lineLimit(2)
                 }
@@ -1318,6 +1481,14 @@ private struct ControlBand: View {
                 if model.isWorking { ProgressView().controlSize(.small) }
             }
             .padding(12)
+            HStack(spacing: 5) {
+                Text("历史记录").font(.system(size: 9, weight: .medium)).foregroundStyle(Palette.muted)
+                Text("自动完成 \(model.resumeSuccessCount) 次 · 你手动完成 \(model.manualRecoveryCount) 次 · 本窗口只显示当前状态")
+                    .font(.system(size: 9)).foregroundStyle(Palette.muted)
+                Spacer()
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 10)
         }
         .background(Palette.surface)
         .overlay(RoundedRectangle(cornerRadius: 7).stroke(Palette.line))
@@ -1616,7 +1787,7 @@ private struct EventRow: View {
         HStack(alignment: .top, spacing: 11) {
             Circle().fill(event.color).frame(width: 8, height: 8).padding(.top, 4)
             VStack(alignment: .leading, spacing: 3) {
-                Text(event.message).font(.system(size: 11, weight: .medium)).fixedSize(horizontal: false, vertical: true)
+                Text(event.displayMessage).font(.system(size: 11, weight: .medium)).fixedSize(horizontal: false, vertical: true)
                 Text(event.time).font(.system(size: 9, design: .monospaced)).foregroundStyle(Palette.muted)
             }
             Spacer()

@@ -1,5 +1,5 @@
 {
-  "config_schema_version": 9,
+  "config_schema_version": 10,
   "codex_state_db": "~/.codex/state_5.sqlite",
   "recovery_grace_seconds": 20,
   "active_thread_idle_seconds": 240,
@@ -11,7 +11,7 @@
   ],
   "max_candidates_per_incident": 8,
   "max_parallel_resumes": 2,
-  "resume_prompt": "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。",
+  "resume_prompt": "继续上一条用户请求中尚未完成的工作，直接动手；不要讨论熔断续聊软件本身，不要重复已经完成的内容。",
   "notify": true,
   "model_retry_enabled": true,
   "model_retry_until_success": true,

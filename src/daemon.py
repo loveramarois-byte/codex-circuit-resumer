@@ -41,8 +41,13 @@ LOG_PATH = APP_HOME / "logs" / "watcher.log"
 RUN_LOG_DIR = APP_HOME / "logs" / "runs"
 PROVIDERS_PATH = APP_HOME / "providers.json"
 EXCHANGE_RATE_CACHE_PATH = APP_HOME / "exchange-rate.json"
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.8.1"
 USER_AGENT = "CodexCircuitResumer/{}".format(APP_VERSION)
+
+DEFAULT_RESUME_PROMPT = (
+    "继续上一条用户请求中尚未完成的工作，直接动手；"
+    "不要讨论熔断续聊软件本身，不要重复已经完成的内容。"
+)
 
 
 @contextmanager
@@ -55,7 +60,7 @@ def sqlite_connection(*args, **kwargs):
         connection.close()
 
 DEFAULT_CONFIG = {
-    "config_schema_version": 9,
+    "config_schema_version": 10,
     "cc_switch_log": str(Path.home() / ".cc-switch" / "logs" / "cc-switch.log"),
     "cc_switch_db": str(Path.home() / ".cc-switch" / "cc-switch.db"),
     "codex_state_db": str(Path.home() / ".codex" / "state_5.sqlite"),
@@ -77,7 +82,7 @@ DEFAULT_CONFIG = {
     "candidate_window_padding_seconds": 8,
     "max_candidates_per_incident": 8,
     "max_parallel_resumes": 2,
-    "resume_prompt": "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。",
+    "resume_prompt": DEFAULT_RESUME_PROMPT,
     "notify": True,
     "model_retry_enabled": True,
     "model_retry_until_success": True,
@@ -211,6 +216,12 @@ def migrate_user_config(user_config):
             current.get("retry_recovery_grace_seconds"), 20
         ) or 20
         current["config_schema_version"] = 9
+    if old_version < 10:
+        old_prompt = str(current.get("resume_prompt") or "").strip()
+        legacy_prompt = "继续。上次因中转站熔断或上游临时故障中断，请从中断处继续，不要重复已经完成的工作。"
+        if not old_prompt or old_prompt == legacy_prompt:
+            current["resume_prompt"] = DEFAULT_RESUME_PROMPT
+        current["config_schema_version"] = 10
     return current
 
 
@@ -2526,6 +2537,36 @@ class Watcher:
         if changed:
             save_state(self.state)
 
+    def reconcile_blocked_tasks(self, now):
+        """Drop manual-action warnings once the blocked turn is no longer current.
+
+        A login or approval failure is deliberately sticky while that exact turn
+        remains unresolved.  Without this reconciliation, however, a user who
+        later continues the same thread successfully keeps seeing a red badge
+        for an obsolete failure forever.
+        """
+        blocked = self.state.setdefault("blocked", {})
+        if not blocked:
+            return False
+        records = thread_paths_from_db(self.config, set(blocked))
+        cleared = 0
+        for thread_id, item in list(blocked.items()):
+            record = records.get(thread_id, {})
+            path_text = record.get("path") or fallback_thread_path(self.config, thread_id)
+            if not path_text:
+                continue
+            status = latest_turn_status(Path(path_text))
+            blocked_turn_id = item.get("turn_id")
+            if not blocked_turn_id or status.get("turn_id") == blocked_turn_id:
+                continue
+            blocked.pop(thread_id, None)
+            self.state.setdefault("retry_attempts", {}).pop(thread_id, None)
+            self.state.setdefault("launcher_failures", {}).pop(thread_id, None)
+            cleared += 1
+        if cleared:
+            self.set_event("已清除 {} 条过期的人工处理提示".format(cleared), now)
+        return bool(cleared)
+
     def reconcile_circuit(self, now):
         if self.state.get("phase") != "circuit_open":
             return
@@ -3308,6 +3349,7 @@ class Watcher:
             self.config, self.state, now=now, expired_only=True
         )
         self.reconcile_inflight(now)
+        self.reconcile_blocked_tasks(now)
         self.reconcile_circuit(now)
         self.discover_retryable_failures(now)
         recovery_changed = self.expedite_retries_after_recovery(now)

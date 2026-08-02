@@ -239,7 +239,8 @@ class ConfigMigrationTests(unittest.TestCase):
 
             self.assertEqual(config["max_parallel_resumes"], 2)
             self.assertEqual(persisted["max_parallel_resumes"], 2)
-            self.assertEqual(persisted["config_schema_version"], 9)
+            self.assertEqual(persisted["config_schema_version"], 10)
+            self.assertEqual(persisted["resume_prompt"], daemon.DEFAULT_RESUME_PROMPT)
 
     def test_upgrade_preserves_custom_parallel_limit(self):
         migrated = daemon.migrate_user_config(
@@ -247,7 +248,16 @@ class ConfigMigrationTests(unittest.TestCase):
         )
 
         self.assertEqual(migrated["max_parallel_resumes"], 4)
-        self.assertEqual(migrated["config_schema_version"], 9)
+        self.assertEqual(migrated["config_schema_version"], 10)
+
+    def test_upgrade_preserves_custom_resume_prompt(self):
+        custom = "请按我的项目上下文继续，不要改设置。"
+        migrated = daemon.migrate_user_config(
+            {"config_schema_version": 9, "resume_prompt": custom}
+        )
+
+        self.assertEqual(migrated["config_schema_version"], 10)
+        self.assertEqual(migrated["resume_prompt"], custom)
 
 
 class DetectionTests(unittest.TestCase):
@@ -1372,6 +1382,8 @@ class ReliabilityTests(unittest.TestCase):
             command = popen.call_args.args[0]
             self.assertIn("model_reasoning_effort=\"medium\"", command)
             self.assertLess(command.index("model_reasoning_effort=\"medium\""), command.index("resume"))
+            self.assertIn(daemon.DEFAULT_RESUME_PROMPT, command[-1])
+            self.assertIn("[Codex熔断续聊:", command[-1])
             for launched in watcher.processes.values():
                 launched["log_handle"].close()
 
@@ -1831,6 +1843,44 @@ class ReliabilityTests(unittest.TestCase):
             watcher.finish_inflight(item, 1, int(time.time()))
             self.assertEqual(watcher.state["scheduled_retries"], [])
             self.assertEqual(watcher.state["blocked"][self.thread_id]["reason"], "需要重新登录 Codex")
+
+    def test_obsolete_blocked_warning_clears_after_newer_turn(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / "rollout.jsonl"
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-auth"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-auth",
+                        last_agent_message=None,
+                        error={"message": "Not logged in"},
+                    ),
+                    event("task_started", turn_id="turn-recovered"),
+                    event("task_complete", turn_id="turn-recovered", last_agent_message="已完成"),
+                ],
+            )
+            state_db = root / "state.db"
+            with daemon.sqlite_connection(str(state_db)) as db:
+                db.execute("CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT)")
+                db.execute(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?)",
+                    (self.thread_id, str(rollout), str(root), "已恢复的任务"),
+                )
+            watcher = daemon.Watcher({**daemon.DEFAULT_CONFIG, "codex_state_db": str(state_db)})
+            watcher.state["blocked"] = {
+                self.thread_id: {
+                    "thread_id": self.thread_id,
+                    "turn_id": "turn-auth",
+                    "title": "已恢复的任务",
+                    "reason": "鉴权失败",
+                }
+            }
+
+            self.assertTrue(watcher.reconcile_blocked_tasks(int(time.time())))
+            self.assertEqual(watcher.state["blocked"], {})
 
     def test_restart_adopts_live_orphan_resume(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
