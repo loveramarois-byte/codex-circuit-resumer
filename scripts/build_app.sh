@@ -18,8 +18,26 @@ backup_ready=0
 restore_backup_on_error() {
   exit_code=$?
   if (( exit_code != 0 && backup_ready )) && [[ -n "$backup_archive" && -f "$backup_archive" ]]; then
-    rm -rf "$DESTINATION"
-    /usr/bin/ditto -x -k "$backup_archive" "${DESTINATION:h}" >/dev/null 2>&1 || true
+    restore_root="${DESTINATION:h}/.codex-circuit-resumer-restore.$$"
+    restored_app="$restore_root/${DESTINATION:t}"
+    if /usr/bin/ditto -x -k "$backup_archive" "$restore_root" >/dev/null 2>&1 \
+      && [[ -x "$restored_app/Contents/MacOS/CodexCircuitResumer" ]]; then
+      failed_destination="${DESTINATION}.failed.$$"
+      if [[ -e "$DESTINATION" ]]; then
+        mv "$DESTINATION" "$failed_destination"
+      fi
+      if mv "$restored_app" "$DESTINATION"; then
+        rm -rf "$failed_destination" "$restore_root"
+      else
+        print -u2 "ERROR: backup restore replacement failed: $backup_archive"
+        if [[ -e "$failed_destination" && ! -e "$DESTINATION" ]]; then
+          mv "$failed_destination" "$DESTINATION" || true
+        fi
+      fi
+    else
+      print -u2 "ERROR: backup restore validation failed: $backup_archive"
+      rm -rf "$restore_root"
+    fi
   fi
   if (( exit_code != 0 )) && [[ -n "$backup_temp" && -f "$backup_temp" ]]; then
     rm -f "$backup_temp"

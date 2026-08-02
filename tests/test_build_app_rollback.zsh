@@ -8,8 +8,10 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 DESTINATION="$TEST_ROOT/Test.app"
 BACKUP_DIR="$TEST_ROOT/.codex-circuit-resumer-backups"
 FAKE_BIN="$TEST_ROOT/bin"
-mkdir -p "$DESTINATION/Contents" "$BACKUP_DIR" "$FAKE_BIN"
+mkdir -p "$DESTINATION/Contents/MacOS" "$BACKUP_DIR" "$FAKE_BIN"
 print -r -- "original-app" > "$DESTINATION/Contents/sentinel.txt"
+print -r -- '#!/bin/sh' 'exit 0' > "$DESTINATION/Contents/MacOS/CodexCircuitResumer"
+chmod 755 "$DESTINATION/Contents/MacOS/CodexCircuitResumer"
 
 for stamp in 202501010101 202501010102 202501010103; do
   archive="$BACKUP_DIR/Test-$stamp.zip"
