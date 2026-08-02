@@ -1338,6 +1338,33 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(watcher.state["manual_recovery_count"], 1)
             self.assertIn("手动继续后完成", watcher.state["last_event"])
 
+    def test_same_turn_self_completion_is_not_counted_as_manual_recovery(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            rollout = root / ("rollout-" + self.thread_id + ".jsonl")
+            now = int(time.time())
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-original", started_at=now - 2),
+                    event("user_message", message="原始项目要求"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-original",
+                        completed_at=now,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+            watcher = daemon.Watcher(dict(daemon.DEFAULT_CONFIG))
+            item = self.queue_item(root, rollout, turn_id="turn-original")
+
+            watcher.finish_inflight(item, 0, now)
+
+            self.assertEqual(watcher.state["resume_success_count"], 0)
+            self.assertEqual(watcher.state["manual_recovery_count"], 0)
+            self.assertIn("任务已自行完成", watcher.state["last_event"])
+
     def test_gateway_success_expedites_retry_without_server_hint(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             now = int(time.time())

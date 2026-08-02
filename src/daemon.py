@@ -2363,7 +2363,12 @@ class Watcher:
             return existing.get("kind")
         marker = str(item.get("resume_marker") or "")
         marker_text = "[Codex熔断续聊:{}]".format(marker) if marker else ""
-        kind = "auto" if marker_text and marker_text in str(current.get("user_message") or "") else "manual"
+        if marker_text and marker_text in str(current.get("user_message") or ""):
+            kind = "auto"
+        elif completed_turn_id != item.get("turn_id"):
+            kind = "manual"
+        else:
+            kind = "self"
         attributed[completed_turn_id] = {
             "kind": kind,
             "thread_id": item.get("thread_id"),
@@ -2375,11 +2380,13 @@ class Watcher:
             self.state["last_success_at"] = now
             self.state["last_success_title"] = title
             self.set_event("自动续接成功：{} ({})".format(title, item.get("thread_id")), now)
-        else:
+        elif kind == "manual":
             self.state["manual_recovery_count"] = int(self.state.get("manual_recovery_count", 0)) + 1
             self.state["last_manual_recovery_at"] = now
             self.state["last_manual_recovery_title"] = title
             self.set_event("检测到你手动继续后完成：{} ({})".format(title, item.get("thread_id")), now)
+        else:
+            self.set_event("任务已自行完成，取消无人值守重试：{}".format(title), now)
         return kind
 
     def finish_inflight(self, item, result, now):

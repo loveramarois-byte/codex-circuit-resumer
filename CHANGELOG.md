@@ -17,13 +17,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - Show “自动成功 / 已发起” and “你手动接回” as separate macOS and Windows status metrics.
 - Preserve pre-2.8 launch history separately and start the precise attribution counters at zero after upgrade.
 - Rename launch events to “已发起自动续接，等待确认结果” until the resumed turn actually completes.
+- Keep same-turn self-completions separate so they are never reported as a user's manual Continue action.
 - Keep daemon health separate from tasks that need manual login or token repair.
 - Store future macOS app upgrade backups as compressed archives, retain the latest three, and restore the previous app automatically if a build fails.
 - Only wake a pending retry when the observed successful request is newer than that task's failure.
 
 ### Verified
 
-- 87 unit tests.
+- 88 unit tests.
 - 50 process-level macOS drills.
 - macOS app build and Windows Python/static syntax checks.
 
