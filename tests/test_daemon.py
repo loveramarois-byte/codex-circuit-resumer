@@ -680,6 +680,42 @@ class ModelRetryTests(unittest.TestCase):
             self.assertIn(thread_id, watcher.state["reasoning_restore_pending"])
             self.assertGreater(watcher.state["reasoning_restore_pending"][thread_id]["not_before"], 101)
 
+    def test_due_desktop_restore_probe_backs_off_after_failure(self):
+        with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+            root = Path(tmp)
+            thread_id = "019fb64d-d041-7842-adbf-01b165ad1b13"
+            rollout = root / ("rollout-" + thread_id + ".jsonl")
+            write_events(
+                rollout,
+                [
+                    event("task_started", turn_id="turn-idle", started_at=90),
+                    event("task_complete", turn_id="turn-idle", completed_at=100, last_agent_message="done"),
+                ],
+            )
+            state_db = self._reasoning_state_db(root, thread_id, rollout)
+            config = dict(daemon.DEFAULT_CONFIG)
+            config.update({"codex_state_db": str(state_db), "capacity_reasoning_promote_enabled": True})
+            watcher = daemon.Watcher(config)
+            watcher.state["reasoning_restore_pending"] = {
+                thread_id: {
+                    "target_effort": "high",
+                    "fallback_effort": "medium",
+                    "not_before": 100,
+                    "title": "低频探测",
+                    "rollout_path": str(rollout),
+                }
+            }
+            with mock.patch.object(
+                daemon, "update_thread_reasoning_effort", return_value={"ok": False, "detail": "Codex 未确认保存目标档位"}
+            ):
+                watcher.restore_due_desktop_reasoning(101)
+                pending = watcher.state["reasoning_restore_pending"][thread_id]
+                self.assertEqual(pending["restore_failures"], 1)
+                self.assertEqual(pending["not_before"], 401)
+                watcher.restore_due_desktop_reasoning(401)
+            self.assertEqual(watcher.state["reasoning_restore_pending"][thread_id]["restore_failures"], 2)
+            self.assertEqual(watcher.state["reasoning_restore_pending"][thread_id]["not_before"], 1001)
+
     def test_recent_manual_fallback_after_capacity_is_discovered(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             root = Path(tmp)

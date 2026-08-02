@@ -2373,7 +2373,13 @@ class Watcher:
                 now,
             )
             return True
-        item["not_before"] = now + 60
+        # A failed Desktop settings probe is non-blocking. Back off the next
+        # probe so an unsupported app-server endpoint cannot wake the daemon
+        # every minute or flood the event log.
+        failures = int(item.get("restore_failures") or 0) + 1
+        item["restore_failures"] = failures
+        retry_delay = min(3600, 300 * (2 ** min(failures - 1, 4)))
+        item["not_before"] = now + retry_delay
         item["last_error"] = str(result.get("detail") or "Codex 对话档位同步失败")[:180]
         self.state["last_reasoning_restore_error"] = item["last_error"]
         warning_throttled(
