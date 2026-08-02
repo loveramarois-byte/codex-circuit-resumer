@@ -1593,6 +1593,22 @@ class ReliabilityTests(unittest.TestCase):
             self.assertEqual(restored["manual_recovery_count"], 0)
             self.assertGreater(restored["resume_metrics_started_at"], 0)
 
+    def test_upgrade_tolerates_invalid_legacy_launch_count(self):
+        for invalid_value in ("not-a-number", {"count": 19}, -3):
+            with self.subTest(invalid_value=invalid_value), tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
+                daemon.ensure_dirs()
+                legacy = daemon.initial_state()
+                legacy.pop("resume_metrics_started_at")
+                legacy.pop("legacy_resume_count")
+                legacy["resume_count"] = invalid_value
+                daemon.atomic_write_json(daemon.STATE_PATH, legacy)
+
+                restored = daemon.load_state()
+
+                self.assertEqual(restored["legacy_resume_count"], 0)
+                self.assertEqual(restored["resume_count"], 0)
+                self.assertGreater(restored["resume_metrics_started_at"], 0)
+
     def test_gateway_retry_temporarily_bypasses_p1_without_reordering(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_runtime(tmp):
             root = Path(tmp)

@@ -282,6 +282,13 @@ def state_backup_path():
     return STATE_PATH.with_name("state.backup.json")
 
 
+def nonnegative_int(value, default=0):
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 def load_state():
     primary_existed = STATE_PATH.exists()
     backup_existed = state_backup_path().exists()
@@ -294,7 +301,7 @@ def load_state():
     if state is not None:
         base.update(state)
         if "resume_metrics_started_at" not in state:
-            base["legacy_resume_count"] = int(state.get("resume_count") or 0)
+            base["legacy_resume_count"] = nonnegative_int(state.get("resume_count"))
             base["resume_count"] = 0
             base["resume_success_count"] = 0
             base["manual_recovery_count"] = 0
