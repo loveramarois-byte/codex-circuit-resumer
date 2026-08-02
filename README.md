@@ -27,6 +27,16 @@
 | 模型档位满载 | 按“极高 → 高 → 中 → 低”降档，可用后再回到原档位 |
 | 你已经手动点了继续 | 识别为“你手动接回”，不会冒充软件自动成功 |
 
+## 真实界面
+
+<p align="center">
+  <img src="assets/app-settings.jpg" alt="Codex 熔断续聊 2.8.0 macOS 实机设置界面" width="92%">
+</p>
+
+<p align="center">
+  <sub>macOS 2.8.0 实机截图：恢复等待、无人值守重试、模型满载降档与自动升回都能直接开关和调整。</sub>
+</p>
+
 > 这是社区维护的非官方项目，与 OpenAI、Codex 或 CC Switch 官方无隶属关系。
 
 ## 为什么需要它
