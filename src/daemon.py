@@ -1176,16 +1176,19 @@ def latest_turn_status(path):
             "started_at": None,
             "completed_at": None,
             "user_message": None,
+            "user_messages": [],
         }
 
     complete = None
     user_message = None
+    user_messages = []
     for event in events[start_index + 1 :]:
         payload = event.get("payload") or {}
         if event.get("type") == "event_msg" and payload.get("type") == "user_message":
             message = payload.get("message")
             if isinstance(message, str):
                 user_message = message
+                user_messages.append(message)
         elif (
             event.get("type") == "response_item"
             and payload.get("type") == "message"
@@ -1197,6 +1200,7 @@ def latest_turn_status(path):
                     parts.append(content["text"])
             if parts:
                 user_message = "".join(parts)
+                user_messages.append(user_message)
         if event.get("type") == "event_msg" and payload.get("type") == "task_complete":
             complete = payload
 
@@ -1215,6 +1219,7 @@ def latest_turn_status(path):
             "started_at": as_epoch((started or {}).get("started_at"), file_mtime),
             "completed_at": None,
             "user_message": user_message,
+            "user_messages": user_messages,
         }
 
     final_message = complete.get("last_agent_message")
@@ -1229,6 +1234,7 @@ def latest_turn_status(path):
             "started_at": started_at,
             "completed_at": completed_at,
             "user_message": user_message,
+            "user_messages": user_messages,
         }
     if error:
         error_text = json.dumps(error, ensure_ascii=False).lower()
@@ -1240,6 +1246,7 @@ def latest_turn_status(path):
             "started_at": started_at,
             "completed_at": completed_at,
             "user_message": user_message,
+            "user_messages": user_messages,
         }
     return {
         "state": "interrupted",
@@ -1248,6 +1255,7 @@ def latest_turn_status(path):
         "started_at": started_at,
         "completed_at": completed_at,
         "user_message": user_message,
+        "user_messages": user_messages,
     }
 
 
@@ -2395,7 +2403,10 @@ class Watcher:
             return existing.get("kind")
         marker = str(item.get("resume_marker") or "")
         marker_text = "[Codex熔断续聊:{}]".format(marker) if marker else ""
-        if marker_text and marker_text in str(current.get("user_message") or ""):
+        messages = current.get("user_messages")
+        if not isinstance(messages, list):
+            messages = [current.get("user_message")]
+        if marker_text and any(marker_text in str(message or "") for message in messages):
             kind = "auto"
         elif completed_turn_id != item.get("turn_id"):
             kind = "manual"

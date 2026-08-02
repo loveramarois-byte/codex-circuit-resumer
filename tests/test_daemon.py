@@ -106,6 +106,29 @@ class TurnStatusTests(unittest.TestCase):
 
             self.assertEqual(status["user_message"], "继续\n[Codex熔断续聊:auto-456]")
 
+    def test_turn_status_keeps_auto_marker_before_later_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rollout.jsonl"
+            write_events(
+                path,
+                [
+                    event("task_started", turn_id="turn-steered", started_at=100),
+                    event("user_message", message="继续\n[Codex熔断续聊:auto-789]"),
+                    event("user_message", message="顺便把测试也跑了"),
+                    event(
+                        "task_complete",
+                        turn_id="turn-steered",
+                        completed_at=110,
+                        last_agent_message="done",
+                    ),
+                ],
+            )
+
+            status = daemon.latest_turn_status(path)
+
+            self.assertEqual(status["user_message"], "顺便把测试也跑了")
+            self.assertIn("继续\n[Codex熔断续聊:auto-789]", status["user_messages"])
+
     def test_windows_npm_codex_shim_uses_cmd_wrapper(self):
         with mock.patch.object(daemon, "IS_WINDOWS", True), mock.patch.dict(
             os.environ, {"COMSPEC": r"C:\Windows\System32\cmd.exe"}
@@ -1394,6 +1417,7 @@ class ReliabilityTests(unittest.TestCase):
                 [
                     event("task_started", turn_id="turn-auto", started_at=now - 2),
                     event("user_message", message="继续\n[Codex熔断续聊:{}]".format(marker)),
+                    event("user_message", message="补充：完成后再跑一次测试"),
                     event("task_complete", turn_id="turn-auto", completed_at=now, last_agent_message="done"),
                 ],
             )

@@ -24,7 +24,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Verified
 
-- 94 unit tests plus a macOS build-rollback integration test.
+- 95 unit tests plus a macOS build-rollback integration test.
 - 50 process-level macOS drills.
 - macOS app build and Windows Python/static syntax checks.
 
